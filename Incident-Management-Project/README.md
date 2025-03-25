@@ -1,9 +1,9 @@
 # Incident Management Project
 
-## 🎯 Project Overview
+Project Overview
 This project demonstrates the configuration of a custom Incident Management System in ServiceNow, showcasing my ability to create tables, configure forms, set business rules, and manage notifications.
 
-## ⚡ Key Features
+Key Features
 - Created a `u_custom_incident` table with key fields such as:
   - `Short Description`
   - `Priority` (Choice field with High, Medium, Low)
@@ -13,7 +13,7 @@ This project demonstrates the configuration of a custom Incident Management Syst
 - Created Business Rules to auto-assign incidents based on priority.
 - Implemented Email Notifications for status updates.
 
-## 📝 How to Import Update Set
+How to Import Update Set
 1. **Log in to ServiceNow Instance:**
    - Navigate to:System Update Sets > Retrieved Update Sets
 2. **Upload XML File:**
