@@ -1,0 +1,8 @@
+# Incident Management Configuration
+This project demonstrates configuring the Incident Management module in ServiceNow.
+
+## Features:
+- Custom Incident Table
+- Form Layout Configuration
+- Business Rules for Auto Assignment
+- Email Notification for High Priority Incidents
