@@ -1,6 +1,6 @@
 # Incident Management Project
 
-Project Overview
+## Project Overview
 This project demonstrates the configuration of a custom Incident Management System in ServiceNow, showcasing my ability to create tables, configure forms, set business rules, and manage notifications.
 
 Key Features
