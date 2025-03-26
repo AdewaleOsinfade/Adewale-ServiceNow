@@ -21,3 +21,7 @@ How to Import Update Set
 - Upload `Incident_Management_Project.xml`.
 3. **Preview and Commit:**
 - Review changes and click **Commit Update Set.**
+
+![Screenshot 2025-03-25 at 1 14 24 PM](https://github.com/user-attachments/assets/8d9917f5-fb3f-482f-9cb8-0aa9d578c919)
+![Screenshot 2025-03-25 at 1 17 42 PM](https://github.com/user-attachments/assets/04df9e47-7c53-45e9-b065-84d4205c13f5)
+![Screenshot 2025-03-25 at 1 21 43 PM](https://github.com/user-attachments/assets/dd4488ff-aa6d-4e2f-9bc3-be04edcba9d9)
