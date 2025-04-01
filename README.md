@@ -1,4 +1,4 @@
-# 👋 Hi, I'm Adewale Osinfade! 
+# Hi, I'm Adewale Osinfade! 
 
 Welcome to my GitHub! I’m a **ServiceNow enthusiast and problem-solver** with a background in **project management, IT service delivery, and automation**. With a **CompTIA Security+ certification** and experience managing complex operations, I’m transitioning into **ServiceNow administration**—leveraging my expertise to build efficient workflows, automate tasks, and optimize IT service management (ITSM).  
 
