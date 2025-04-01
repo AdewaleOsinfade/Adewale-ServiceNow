@@ -18,4 +18,4 @@ Check out my repositories for full details!
 
 ## 🔗 Connect With Me  
 📧 Email: AdewaleOsinfade@gmail.com  
-💼 LinkedIn: [(https://www.linkedin.com/in/adewale-osinfade-page/))  
+💼 LinkedIn: www.linkedin.com/in/adewale-osinfade-page  
