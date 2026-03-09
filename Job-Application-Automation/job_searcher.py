@@ -43,6 +43,7 @@ import os
 import re
 import time
 import webbrowser
+import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -119,6 +120,27 @@ def _job_dedup_key(job):
     title   = re.sub(r"\W+", " ", job["title"].lower()).strip()
     company = re.sub(r"\W+", " ", job["company"].lower()).strip()
     return f"{title}||{company}"
+
+
+def _parse_rss_items(data):
+    """Parse RSS 2.0 XML bytes; return list of {title, link, description, pubDate}."""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return []
+    items = []
+    for item in root.iter("item"):
+        def _t(tag):
+            el = item.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+        items.append({
+            "title":       _t("title"),
+            "link":        _t("link"),
+            "description": re.sub(r"<[^>]+>", " ", _t("description")),
+            "pubDate":     _t("pubDate"),
+            "author":      _t("author"),
+        })
+    return items
 
 
 # Strict allowlist: only these states/abbreviations are accepted
@@ -581,6 +603,141 @@ def search_jobs_usajobs(keywords):
     return found
 
 
+def search_jobs_remoteok():
+    """
+    RemoteOK public JSON API — free, no key needed.
+    API: https://remoteok.com/api
+    The first element of the array is metadata and is skipped.
+    Only jobs tagged 'business-analyst', 'servicenow', 'itsm', or
+    'systems-analyst' are returned.
+    """
+    _TARGET_TAGS = {
+        "business-analyst", "business analyst",
+        "servicenow", "itsm", "systems-analyst", "systems analyst",
+        "it-analyst", "it analyst",
+    }
+    found = []
+    try:
+        data = json.loads(_fetch("https://remoteok.com/api"))
+        for job in data[1:]:                        # element 0 is metadata
+            tags_raw  = job.get("tags", [])
+            tags_norm = {t.lower() for t in tags_raw} | {t.lower().replace(" ", "-") for t in tags_raw}
+            if not (tags_norm & _TARGET_TAGS):
+                continue
+            sal_min = job.get("salary_min", "")
+            sal_max = job.get("salary_max", "")
+            sal = f"${int(sal_min):,} – ${int(sal_max):,}" if sal_min and sal_max else ""
+            epoch  = job.get("date", "")
+            posted = ""
+            if epoch:
+                try:
+                    posted = datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d")
+                except (ValueError, OSError):
+                    pass
+            job_id = job.get("id", "")
+            found.append(_make_job(
+                title       = job.get("position", ""),
+                company     = job.get("company", ""),
+                location    = "Remote",
+                url         = job.get("url") or f"https://remoteok.com/remote-jobs/{job_id}",
+                description = job.get("description", ""),
+                posted      = posted,
+                source      = "RemoteOK",
+                salary      = sal,
+                tags        = ", ".join(tags_raw),
+            ))
+    except Exception as e:
+        print(f"  RemoteOK error: {e}")
+    return found
+
+
+def search_jobs_weworkremotely():
+    """
+    We Work Remotely RSS feed — free, no key needed.
+    Feed: https://weworkremotely.com/remote-jobs.rss
+    Filters to titles containing Business Analyst, ServiceNow, ITSM,
+    Systems Analyst, or IT Analyst keywords.
+    WWR titles are usually formatted "Company: Job Title" — the company
+    name is split out from the title automatically.
+    """
+    _TARGET_KWS = {
+        "business analyst", "servicenow", "itsm",
+        "systems analyst", "it analyst", "business system",
+    }
+    found = []
+    try:
+        data = _fetch("https://weworkremotely.com/remote-jobs.rss")
+        for item in _parse_rss_items(data):
+            raw_title = item["title"]
+            if not any(kw in raw_title.lower() for kw in _TARGET_KWS):
+                continue
+            # "Company: Job Title" → split on first colon
+            if ": " in raw_title:
+                company, title = raw_title.split(": ", 1)
+            else:
+                company, title = "See listing", raw_title
+            found.append(_make_job(
+                title       = title.strip(),
+                company     = company.strip(),
+                location    = "Remote",
+                url         = item["link"],
+                description = item["description"],
+                posted      = item["pubDate"],
+                source      = "WeWorkRemotely",
+            ))
+    except Exception as e:
+        print(f"  WeWorkRemotely error: {e}")
+    return found
+
+
+def search_jobs_dice_rss_dc():
+    """
+    Dice.com RSS feed pre-filtered to Maryland / DC / Virginia.
+    Searches both 'business analyst' and 'ServiceNow' in the DC metro area.
+    Free, no key needed.
+    """
+    rss_queries = [
+        ("business_analyst",  "Maryland%2C+DC%2C+Virginia"),
+        ("ServiceNow",        "Maryland%2C+DC%2C+Virginia"),
+    ]
+    found = []
+    for q, loc in rss_queries:
+        try:
+            url  = f"https://www.dice.com/jobs/q-{q}-l-{loc}/rss"
+            data = _fetch(url)
+            for item in _parse_rss_items(data):
+                found.append(_make_job(
+                    title       = item["title"],
+                    company     = item.get("author", "See listing"),
+                    location    = "Maryland / DC / Virginia",
+                    url         = item["link"],
+                    description = item["description"],
+                    posted      = item["pubDate"],
+                    source      = "Dice",
+                ))
+            time.sleep(1.2)
+        except Exception as e:
+            print(f"  Dice RSS error ({q}): {e}")
+    return found
+
+
+def open_clearancejobs_browser():
+    """
+    ClearanceJobs browser fallback — opens a pre-filtered search in the
+    default browser for Business Analyst roles in Maryland, DC, and Virginia.
+    No public API is available; this is a manual-review helper only.
+    """
+    url = (
+        "https://www.clearancejobs.com/jobs"
+        "?type=1&title=business+analyst"
+        "&location=Maryland%2C+DC%2C+Virginia"
+    )
+    print("\n  [ClearanceJobs] Opening pre-filtered search in your browser...")
+    print(f"  URL: {url}")
+    print("  Review listings manually and use option [2] to log any you apply to.")
+    open_in_browser(url)
+
+
 # ─── FILTERING & SORTING ────────────────────────────────────────────────────
 
 def filter_jobs(jobs, profile):
@@ -857,11 +1014,17 @@ def interactive_apply(jobs, profile):
             cover_file = save_cover_letter(profile, job)
             print(f"\n  Cover letter saved: {cover_file}")
             handle_apply(job, profile)
-            notes           = input("\n  Notes (press Enter to skip): ").strip()
-            resume_included = bool(resume_path)
-            tracker.log_application(job, notes=notes, resume_included=resume_included)
-            applied_count += 1
-            print("  Application logged.")
+
+            # Only log after the user confirms they actually submitted
+            submitted = input("\n  Did you submit this application? [y/n]: ").strip().lower()
+            if submitted == "y":
+                notes           = input("  Notes (press Enter to skip): ").strip()
+                resume_included = bool(resume_path)
+                tracker.log_application(job, notes=notes, resume_included=resume_included)
+                applied_count += 1
+                print(f"  Logged: {job['title']} @ {job['company']} | {job['source']} | {job['url']}")
+            else:
+                print("  Not logged — skipped.")
 
     print(f"\nDone. Logged {applied_count} application(s) to {TRACKER_FILE}")
 
@@ -978,13 +1141,16 @@ def _run_all_searches(profile, keywords):
     all_jobs = []
 
     sources = [
-        ("Remotive",  lambda: search_jobs_remotive(keywords[:5])),
-        ("JSearch",   lambda: search_jobs_jsearch(keywords[:4])),
-        ("LinkedIn",  lambda: search_jobs_linkedin(keywords[:4])),
-        ("Reed",      lambda: search_jobs_reed(keywords[:4])),
-        ("The Muse",  lambda: search_jobs_themuse(keywords[:3])),
-        ("Adzuna",    lambda: search_jobs_adzuna(keywords[:4], location)),
-        ("USAJobs",   lambda: search_jobs_usajobs(keywords[:3])),
+        ("Remotive",       lambda: search_jobs_remotive(keywords[:5])),
+        ("RemoteOK",       lambda: search_jobs_remoteok()),
+        ("WeWorkRemotely", lambda: search_jobs_weworkremotely()),
+        ("Dice (DC/VA/MD)",lambda: search_jobs_dice_rss_dc()),
+        ("JSearch",        lambda: search_jobs_jsearch(keywords[:4])),
+        ("LinkedIn",       lambda: search_jobs_linkedin(keywords[:4])),
+        ("Reed",           lambda: search_jobs_reed(keywords[:4])),
+        ("The Muse",       lambda: search_jobs_themuse(keywords[:3])),
+        ("Adzuna",         lambda: search_jobs_adzuna(keywords[:4], location)),
+        ("USAJobs",        lambda: search_jobs_usajobs(keywords[:3])),
     ]
 
     for name, fn in sources:
@@ -1049,6 +1215,9 @@ def main():
         print(f"  Saved to {FOUND_JOBS_FILE}")
 
         display_jobs(filtered)
+
+        # ClearanceJobs has no public API — open a pre-filtered browser search
+        open_clearancejobs_browser()
 
         if choice == "2" and filtered:
             go = input("\n  Start applying interactively? [y/n]: ").strip().lower()
