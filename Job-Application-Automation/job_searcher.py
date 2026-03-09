@@ -135,35 +135,91 @@ _US_MARKERS = {
     "work from home", "wfh", "us only", "north america",
 }
 
+# Preferred DC-metro / Maryland area locations — always accepted
+_PREFERRED_LOCATIONS = {
+    "maryland", "virginia", "washington dc", "district of columbia",
+    "northern virginia", "nova", "baltimore", "rockville", "bethesda",
+    "silver spring", "mclean", "tysons", "reston", "arlington",
+    "alexandria", "annapolis", "columbia", "germantown", "gaithersburg",
+    "bowie", "laurel", "greenbelt", "hyattsville", "chevy chase",
+}
+
+# Substrings that confirm a location is clearly outside the US/Canada.
+# Only reject when one of these appears with NO competing US signal.
+_FOREIGN_MARKERS = {
+    "united kingdom", " uk,", "(uk)", "england", "scotland", "wales",
+    "london", "manchester", "birmingham",
+    "india", "bangalore", "mumbai", "hyderabad", "delhi", "chennai",
+    "australia", "sydney", "melbourne",
+    "germany", "berlin", "munich",
+    "france", "paris",
+    "netherlands", "amsterdam",
+    "ireland", "dublin",
+    "singapore",
+    "brazil", "são paulo",
+    "mexico", "mexico city",
+    "poland", "warsaw",
+    "ukraine", "kyiv",
+    "pakistan", "karachi", "lahore",
+    "philippines", "manila",
+    "nigeria", "lagos",
+    "kenya", "nairobi",
+    "japan", "tokyo",
+    "china", "beijing", "shanghai",
+    "new zealand", "auckland",
+    "south africa", "johannesburg",
+}
+
 
 def _is_us_or_remote(location, source=""):
     """
-    Return True if the job location is in the US or remote.
+    Pass remote jobs and US-based jobs (any state); only reject locations
+    that are clearly in a foreign country with no competing US signal.
     Sources that are inherently US/remote (USAJobs, Remotive) always pass.
-    Unknown/unlisted locations pass through so they are not silently dropped.
+    Unknown or unlisted locations pass through for the user to review.
     """
     if source in ("USAJobs", "Remotive"):
         return True
     loc = location.lower().strip()
+    # Unknown / unlisted → let through
     if not loc or loc in ("see listing", "worldwide", ""):
-        return True  # unknown — let the user see it and judge
+        return True
+    # Remote / work-from-home markers
     if any(m in loc for m in _US_MARKERS):
         return True
-    # "City, ST" patterns — check every token against state abbreviations
-    tokens = re.split(r"[\s,/]+", loc)
+    # Preferred DC-metro / Maryland area
+    if any(p in loc for p in _PREFERRED_LOCATIONS):
+        return True
+    # Any US state abbreviation as a standalone token (e.g. "Bethesda, MD")
+    tokens = re.split(r"[\s,/()]+", loc)
     if any(t in _US_STATE_ABBREVS for t in tokens):
         return True
-    return False
+    # Reject only if a foreign marker appears AND no US signal is present
+    if any(f in loc for f in _FOREIGN_MARKERS):
+        return False
+    # Default: pass through — don't silently drop uncertain locations
+    return True
+
+
+# Title keywords that always pass regardless of the profile target_roles list
+_TITLE_ACCEPT_KEYWORDS = frozenset([
+    "servicenow", "itsm", "business analyst", "business system analyst",
+])
 
 
 def _matches_target_role(title, profile):
     """
-    Return True if the job title contains at least one substring from
-    target_roles or titles in profile.json (case-insensitive).
+    Return True if the job title contains:
+      - any of the hard-coded always-accept keywords (ServiceNow, ITSM,
+        Business Analyst, Business System Analyst), OR
+      - any substring from target_roles or titles in profile.json.
+    Case-insensitive substring match throughout.
     """
-    prefs      = profile["job_preferences"]
-    all_roles  = prefs.get("target_roles", []) + prefs.get("titles", [])
-    title_low  = title.lower()
+    title_low = title.lower()
+    if any(kw in title_low for kw in _TITLE_ACCEPT_KEYWORDS):
+        return True
+    prefs     = profile["job_preferences"]
+    all_roles = prefs.get("target_roles", []) + prefs.get("titles", [])
     return any(role.lower() in title_low for role in all_roles)
 
 
@@ -448,26 +504,34 @@ def search_jobs_themuse(keywords):
 def search_jobs_usajobs(keywords):
     """
     USAJobs API — free key from https://developer.usajobs.gov/
-    Set env: USAJOBS_API_KEY, USAJOBS_USER_AGENT (must be your email address)
-    Great for government IT/BA positions with ServiceNow.
+    Set env: USAJOBS_API_KEY  (your API key)
+             USAJOBS_USER_AGENT  (your registered email address)
+    Required headers: Authorization-Key = API key, User-Agent = email.
+    Searches fixed focused terms ('Business Analyst', 'ServiceNow') that
+    match government IT job titles, plus LocationName=United States.
     """
     api_key    = os.environ.get("USAJOBS_API_KEY")
     user_agent = os.environ.get("USAJOBS_USER_AGENT", "")
     if not api_key:
         print("  USAJobs: set USAJOBS_API_KEY + USAJOBS_USER_AGENT env vars (developer.usajobs.gov).")
         return []
+    # USAJobs titles match government job series names — use focused terms
+    usajobs_keywords = ["Business Analyst", "ServiceNow"]
     found = []
-    for kw in keywords[:3]:
+    for kw in usajobs_keywords:
         try:
-            q   = urllib.parse.quote(kw)
-            url = (
-                f"https://data.usajobs.gov/api/search"
-                f"?Keyword={q}&ResultsPerPage=25&RemoteIndicator=True"
-            )
+            params = urllib.parse.urlencode({
+                "Keyword":         kw,
+                "LocationName":    "United States",
+                "ResultsPerPage":  25,
+                "RemoteIndicator": "True",
+                "WhoMayApply":     "All",
+            })
+            url = f"https://data.usajobs.gov/api/search?{params}"
             headers = {
                 "Authorization-Key": api_key,
-                "Host":              "data.usajobs.gov",
                 "User-Agent":        user_agent,
+                "Host":              "data.usajobs.gov",
             }
             data  = json.loads(_fetch(url, headers=headers))
             items = data.get("SearchResult", {}).get("SearchResultItems", [])
