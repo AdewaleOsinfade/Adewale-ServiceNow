@@ -29,10 +29,10 @@ OPTIONAL API KEYS:
         export ADZUNA_APP_ID=your_id
         export ADZUNA_APP_KEY=your_key
 
-OPTIONAL (LinkedIn Easy Apply automation only):
-    pip install selenium
-    Download ChromeDriver matching your Chrome version:
-    https://chromedriver.chromium.org/downloads
+OPTIONAL (Auto-fill automation):
+    selenium and webdriver-manager are installed automatically on first use.
+    Chrome browser must be installed on your system.
+    The script will install the matching ChromeDriver via webdriver-manager.
 """
 
 import base64
@@ -857,100 +857,410 @@ def show_application_checklist(job, profile):
     print("─" * 55)
 
 
-def linkedin_easy_apply(job, profile):
+def _ensure_selenium():
+    """Auto-install selenium and webdriver-manager if not already installed."""
+    import subprocess, sys
+    missing = []
+    try:
+        import selenium  # noqa: F401
+    except ImportError:
+        missing.append("selenium")
+    try:
+        import webdriver_manager  # noqa: F401
+    except ImportError:
+        missing.append("webdriver-manager")
+    if missing:
+        print(f"  Auto-installing: {', '.join(missing)} ...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+            )
+            print("  Installed successfully.")
+        except Exception as e:
+            print(f"  Install failed: {e}")
+            print("  Run manually:  pip install selenium webdriver-manager")
+            return False
+    return True
+
+
+def selenium_autofill_apply(job, profile, cover_letter_text=""):
     """
-    Uses Selenium to pre-fill a LinkedIn Easy Apply form.
-    Requires: pip install selenium  and  ChromeDriver on PATH.
-    Falls back to browser-open if Selenium is unavailable.
+    Universal Selenium auto-fill for LinkedIn Easy Apply, Indeed, Greenhouse,
+    and Lever.  Auto-installs selenium + webdriver-manager on first use.
+
+    Fills as many fields as possible, then highlights the Submit button in green
+    and waits for the user to review and click Submit in the browser.
     """
+    if not _ensure_selenium():
+        open_in_browser(job["url"])
+        show_application_checklist(job, profile)
+        return
+
     try:
         from selenium import webdriver
         from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support.ui import WebDriverWait, Select
         from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import NoSuchElementException, TimeoutException
-    except ImportError:
-        print("  Selenium not installed. Run: pip install selenium")
+        from selenium.common.exceptions import (
+            NoSuchElementException, TimeoutException,
+            ElementNotInteractableException, StaleElementReferenceException,
+        )
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.chrome.service import Service
+    except ImportError as e:
+        print(f"  Could not load Selenium modules: {e}")
         print("  Falling back to regular browser open...")
         open_in_browser(job["url"])
         show_application_checklist(job, profile)
         return
 
-    personal = profile.get("personal", {})
-    print("\n  Launching Chrome for LinkedIn Easy Apply...")
-    print("  You may need to log in to LinkedIn in the browser window.")
+    personal    = profile.get("personal", {})
+    name_parts  = personal.get("name", "").split(" ", 1)
+    first_name  = name_parts[0] if name_parts else ""
+    last_name   = name_parts[1] if len(name_parts) > 1 else ""
+    email       = personal.get("email", "")
+    phone       = personal.get("phone", "")
+    linkedin    = personal.get("linkedin", "")
+    github      = personal.get("github", "")
+    resume_path = personal.get("resume_path", "")
+    full_name   = personal.get("name", "")
+
+    url           = job.get("url", "")
+    is_linkedin   = "linkedin.com"  in url
+    is_greenhouse = "greenhouse.io" in url or "grnh.se" in url
+    is_lever      = "lever.co"      in url or "jobs.lever" in url
 
     options = webdriver.ChromeOptions()
-    driver  = webdriver.Chrome(options=options)
+    options.add_argument("--start-maximized")
 
+    print("\n  Launching Chrome... (webdriver-manager downloads ChromeDriver on first run)")
     try:
-        driver.get(job["url"])
-        wait = WebDriverWait(driver, 15)
-
-        # Click Easy Apply button
-        try:
-            btn = wait.until(EC.element_to_be_clickable((
-                By.CSS_SELECTOR,
-                ".jobs-apply-button, [data-control-name='jobdetails_topcard_inapply'], "
-                ".apply-button, button[aria-label*='Easy Apply']"
-            )))
-            btn.click()
-            time.sleep(2)
-        except TimeoutException:
-            print("  Easy Apply button not found — job may use an external application.")
-            show_application_checklist(job, profile)
-            input("  Press Enter when done to close the browser...")
-            return
-
-        # Pre-fill common form fields
-        def fill(selectors, value):
-            if not value:
-                return
-            for sel in selectors:
-                try:
-                    el = driver.find_element(By.CSS_SELECTOR, sel)
-                    el.clear()
-                    el.send_keys(value)
-                    return
-                except NoSuchElementException:
-                    pass
-
-        fill(
-            ["input[name='name']", "input[aria-label*='name' i]", "input[id*='name']"],
-            personal.get("name", "")
-        )
-        fill(
-            ["input[type='email']", "input[name='email']", "input[aria-label*='email' i]"],
-            personal.get("email", "")
-        )
-        fill(
-            ["input[type='tel']", "input[name='phone']", "input[aria-label*='phone' i]"],
-            personal.get("phone", "")
-        )
-
-        print("\n  Form pre-filled where possible. Review everything carefully.")
+        service = Service(ChromeDriverManager().install())
+        driver  = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        print(f"  Chrome launch failed: {e}")
+        print("  Make sure Google Chrome is installed on your system.")
+        print("  Falling back to regular browser open...")
+        open_in_browser(url)
         show_application_checklist(job, profile)
-        input("\n  Make any final changes in the browser, then press Enter here to continue...")
+        return
+
+    # ── Helper: fill a text field ────────────────────────────────────────────
+    def _fill(selectors, value):
+        if not value:
+            return False
+        for sel in selectors:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                el.clear()
+                el.send_keys(value)
+                return True
+            except (NoSuchElementException, ElementNotInteractableException,
+                    StaleElementReferenceException):
+                pass
+            except Exception:
+                pass
+        return False
+
+    # ── Helper: select a <select> dropdown ──────────────────────────────────
+    def _select(selectors, option_texts):
+        for sel in selectors:
+            try:
+                el     = driver.find_element(By.CSS_SELECTOR, sel)
+                select = Select(el)
+                for opt_text in option_texts:
+                    try:
+                        select.select_by_visible_text(opt_text)
+                        return True
+                    except Exception:
+                        pass
+                # Partial match fallback
+                for option in select.options:
+                    if any(t.lower() in option.text.lower() for t in option_texts):
+                        option.click()
+                        return True
+            except (NoSuchElementException, ElementNotInteractableException):
+                pass
+            except Exception:
+                pass
+        return False
+
+    # ── Helper: upload a file ────────────────────────────────────────────────
+    def _upload(selectors, filepath):
+        if not filepath:
+            return False
+        if not os.path.isabs(filepath):
+            filepath = os.path.abspath(filepath)
+        if not os.path.exists(filepath):
+            print(f"  Resume not found at: {filepath}")
+            return False
+        for sel in selectors:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                el.send_keys(filepath)
+                return True
+            except (NoSuchElementException, ElementNotInteractableException):
+                pass
+            except Exception:
+                pass
+        return False
+
+    # ── Helper: highlight Submit button ─────────────────────────────────────
+    def _highlight_submit():
+        xpaths = [
+            "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submit')]",
+            "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply')]",
+            "//input[@type='submit']",
+            "//button[contains(@class,'submit')]",
+            "//button[@data-easy-apply-next-button]",
+        ]
+        css_list = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button[aria-label*='submit' i]",
+            "button[aria-label*='apply' i]",
+            ".submit-button",
+            "#submit-btn",
+            "[data-easy-apply-next-button]",
+        ]
+        js = ("arguments[0].style.border='4px solid green';"
+              "arguments[0].style.backgroundColor='#c8ffc8';"
+              "arguments[0].scrollIntoView({behavior:'smooth', block:'center'});")
+        for sel in css_list:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                driver.execute_script(js, el)
+                return True
+            except Exception:
+                pass
+        for xp in xpaths:
+            try:
+                el = driver.find_element(By.XPATH, xp)
+                driver.execute_script(js, el)
+                return True
+            except Exception:
+                pass
+        return False
+
+    filled = []
+    try:
+        print(f"  Opening: {url}")
+        driver.get(url)
+        time.sleep(3)
+
+        # ── LinkedIn: click Easy Apply button ────────────────────────────────
+        if is_linkedin:
+            print("  LinkedIn detected — looking for Easy Apply button...")
+            try:
+                btn = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    ".jobs-apply-button, button[aria-label*='Easy Apply' i], "
+                    "button[data-control-name='jobdetails_topcard_inapply']"
+                )))
+                btn.click()
+                time.sleep(2)
+                print("  Easy Apply panel opened.")
+            except TimeoutException:
+                print("  Easy Apply button not found — may need LinkedIn login or uses external form.")
+
+        # ── First name ───────────────────────────────────────────────────────
+        if _fill([
+            "input[name='first_name']",
+            "input[id*='first_name' i]",
+            "input[id*='firstName' i]",
+            "input[aria-label*='First name' i]",
+            "input[placeholder*='First name' i]",
+            "input[autocomplete='given-name']",
+        ], first_name):
+            filled.append("First name")
+
+        # ── Last name ────────────────────────────────────────────────────────
+        if _fill([
+            "input[name='last_name']",
+            "input[id*='last_name' i]",
+            "input[id*='lastName' i]",
+            "input[aria-label*='Last name' i]",
+            "input[placeholder*='Last name' i]",
+            "input[autocomplete='family-name']",
+        ], last_name):
+            filled.append("Last name")
+
+        # ── Full name (Lever and some other platforms use one name field) ────
+        if "First name" not in filled:
+            if _fill([
+                "input[name='name']",
+                "input[aria-label*='Full name' i]",
+                "input[placeholder*='Full name' i]",
+                "input[placeholder*='Your name' i]",
+                "input[autocomplete='name']",
+            ], full_name):
+                filled.append("Full name")
+
+        # ── Email ────────────────────────────────────────────────────────────
+        if _fill([
+            "input[type='email']",
+            "input[name='email']",
+            "input[id*='email' i]",
+            "input[aria-label*='email' i]",
+            "input[placeholder*='email' i]",
+            "input[autocomplete='email']",
+        ], email):
+            filled.append("Email")
+
+        # ── Phone ────────────────────────────────────────────────────────────
+        if _fill([
+            "input[type='tel']",
+            "input[name='phone']",
+            "input[name='phone_number']",
+            "input[id*='phone' i]",
+            "input[aria-label*='phone' i]",
+            "input[placeholder*='phone' i]",
+            "input[autocomplete='tel']",
+        ], phone):
+            filled.append("Phone")
+
+        # ── LinkedIn URL ─────────────────────────────────────────────────────
+        if _fill([
+            "input[name='urls[LinkedIn]']",       # Lever
+            "input[name='linkedin']",
+            "input[name='linkedin_url']",
+            "input[id*='linkedin' i]",
+            "input[aria-label*='LinkedIn' i]",
+            "input[placeholder*='linkedin.com' i]",
+        ], linkedin):
+            filled.append("LinkedIn URL")
+
+        # ── GitHub URL ───────────────────────────────────────────────────────
+        if _fill([
+            "input[name='urls[GitHub]']",          # Lever
+            "input[name='github']",
+            "input[name='github_url']",
+            "input[id*='github' i]",
+            "input[aria-label*='GitHub' i]",
+            "input[placeholder*='github.com' i]",
+        ], github):
+            filled.append("GitHub URL")
+
+        # ── Resume upload ────────────────────────────────────────────────────
+        if _upload([
+            "input[type='file'][name*='resume' i]",
+            "input[type='file'][id*='resume' i]",
+            "input[type='file'][aria-label*='resume' i]",
+            "input[type='file'][accept*='pdf' i]",
+            "input[type='file']",
+        ], resume_path):
+            filled.append("Resume upload")
+            time.sleep(1)
+
+        # ── Cover letter ─────────────────────────────────────────────────────
+        if cover_letter_text:
+            if _fill([
+                "textarea[name='cover_letter']",
+                "textarea[name='comments']",           # Lever
+                "textarea[id*='cover_letter' i]",
+                "textarea[id*='coverletter' i]",
+                "textarea[aria-label*='cover letter' i]",
+                "textarea[placeholder*='cover letter' i]",
+                "textarea[placeholder*='message' i]",
+            ], cover_letter_text):
+                filled.append("Cover letter")
+
+        # ── Work authorization → Yes ─────────────────────────────────────────
+        auth_yes = [
+            "Yes", "Yes, I am authorized", "Yes, I am legally authorized",
+            "Authorized", "Yes - I am legally authorized to work in the United States",
+            "I am authorized to work in the US",
+        ]
+        for sel in [
+            "select[name*='authorization' i]",
+            "select[name*='authorized' i]",
+            "select[id*='work_auth' i]",
+            "select[id*='authorization' i]",
+            "select[aria-label*='authorized to work' i]",
+            "select[aria-label*='work authorization' i]",
+        ]:
+            if _select([sel], auth_yes):
+                if "Work authorization" not in filled:
+                    filled.append("Work authorization")
+
+        # ── Sponsorship → No ────────────────────────────────────────────────
+        sponsor_no = [
+            "No", "No, I do not require sponsorship",
+            "No, I don't require sponsorship",
+            "I do not require sponsorship",
+            "No sponsorship needed",
+        ]
+        for sel in [
+            "select[name*='sponsor' i]",
+            "select[id*='sponsor' i]",
+            "select[aria-label*='sponsor' i]",
+            "select[aria-label*='visa' i]",
+        ]:
+            if _select([sel], sponsor_no):
+                if "Sponsorship" not in filled:
+                    filled.append("Sponsorship")
+
+        # ── Experience → 5–7 years ───────────────────────────────────────────
+        exp_options = [
+            "5", "6", "7", "5-7 years", "5+ years", "5 years", "6 years", "7 years",
+            "More than 5 years", "6-10 years", "5 to 7 years", "5-10 years",
+        ]
+        for sel in [
+            "select[name*='experience' i]",
+            "select[id*='experience' i]",
+            "select[aria-label*='years of experience' i]",
+            "select[aria-label*='experience' i]",
+        ]:
+            if _select([sel], exp_options):
+                if "Experience" not in filled:
+                    filled.append("Experience")
+
+        # ── Scroll to bottom ─────────────────────────────────────────────────
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1)
+
+        # ── Highlight Submit button ──────────────────────────────────────────
+        found_submit = _highlight_submit()
+
+        # ── Summary ──────────────────────────────────────────────────────────
+        print()
+        if filled:
+            print(f"  Auto-filled  : {', '.join(filled)}")
+        else:
+            print("  No fields were auto-filled — form may need manual entry.")
+        if not found_submit:
+            print("  Submit button not highlighted — scroll down to find it manually.")
+
+        print("\n" + "=" * 55)
+        print("  READY — please review the form and click Submit when ready.")
+        print("=" * 55)
+        input("\n  Press Enter in Terminal when you are finished (before or after clicking Submit)...")
+
+    except Exception as e:
+        print(f"\n  Unexpected error during auto-fill: {e}")
+        print("  The browser is still open — please fill and submit manually.")
+        input("  Press Enter to continue...")
 
     finally:
-        input("  Press Enter to close the browser window...")
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
-def handle_apply(job, profile):
-    """Route to Selenium (LinkedIn) or plain browser open, then show checklist."""
-    url          = job.get("url", "")
-    is_linkedin  = "linkedin.com" in url
-
-    if is_linkedin:
-        print("\n  LinkedIn job detected.")
-        use_sel = input("  Use Selenium for Easy Apply pre-fill? [y/n]: ").strip().lower()
-        if use_sel == "y":
-            linkedin_easy_apply(job, profile)
-            return
-
-    open_in_browser(url)
-    show_application_checklist(job, profile)
+def handle_apply(job, profile, cover_letter_text=""):
+    """
+    Open job URL with Selenium auto-fill (universal) or plain browser.
+    Offers Selenium for all sites, not just LinkedIn.
+    """
+    url = job.get("url", "")
+    print(f"\n  Job URL: {url}")
+    use_sel = input("  Use Selenium auto-fill? [y/n]: ").strip().lower()
+    if use_sel == "y":
+        selenium_autofill_apply(job, profile, cover_letter_text=cover_letter_text)
+    else:
+        open_in_browser(url)
+        show_application_checklist(job, profile)
 
 
 # ─── DISPLAY ────────────────────────────────────────────────────────────────
@@ -1011,9 +1321,10 @@ def interactive_apply(jobs, profile):
                 continue
 
         if action == "a":
+            cover_text = generate_cover_letter(profile, job)
             cover_file = save_cover_letter(profile, job)
             print(f"\n  Cover letter saved: {cover_file}")
-            handle_apply(job, profile)
+            handle_apply(job, profile, cover_letter_text=cover_text)
 
             # Only log after the user confirms they actually submitted
             submitted = input("\n  Did you submit this application? [y/n]: ").strip().lower()

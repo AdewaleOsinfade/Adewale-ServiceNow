@@ -86,12 +86,30 @@ For each job you can:
 [ ] Double-check requirements before submitting
 ```
 
-### LinkedIn Easy Apply (Selenium)
-```bash
-pip install selenium
-# Download ChromeDriver: https://chromedriver.chromium.org/downloads
+### Universal Selenium Auto-Fill
+When you choose option `[2]` and press `[a]` on any job, you'll be asked:
 ```
-When you choose option `[2]` and encounter a LinkedIn job, you'll be prompted whether to use Selenium. It pre-fills contact fields and pauses for you to review before submitting.
+Use Selenium auto-fill? [y/n]:
+```
+If you choose **y**, the tool will:
+1. **Auto-install** `selenium` and `webdriver-manager` if not already present
+2. **Launch Chrome** automatically (no manual ChromeDriver download needed)
+3. **Auto-fill** as many form fields as possible:
+   - First name, last name, email, phone
+   - LinkedIn URL, GitHub URL
+   - Resume upload (attaches file at your `resume_path`)
+   - Cover letter (pastes personalized letter into text area)
+   - Work authorization dropdowns → selects "Yes, I am authorized"
+   - Sponsorship dropdowns → selects "No, I do not require sponsorship"
+   - Experience dropdowns → selects closest match to 5–7 years
+4. **Scroll to the bottom** and **highlight the Submit button in green**
+5. Print `READY — please review the form and click Submit when ready`
+6. **Wait for you to press Enter** in Terminal
+7. Ask `Did you submit? [y/n]` — only logs to `applications.csv` if you confirm **y**
+
+Works for: **LinkedIn Easy Apply**, **Indeed**, **Greenhouse**, **Lever**, and most standard job application forms.
+
+**Requirements:** Google Chrome must be installed. `selenium` and `webdriver-manager` are installed automatically.
 
 ### Daily Digest Mode
 - Remembers every job it has shown you (stored in `seen_jobs.json`)
