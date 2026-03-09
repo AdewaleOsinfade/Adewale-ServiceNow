@@ -121,84 +121,70 @@ def _job_dedup_key(job):
     return f"{title}||{company}"
 
 
-# US state abbreviations used by the location filter
-_US_STATE_ABBREVS = {
-    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga",
-    "hi", "id", "il", "in", "ia", "ks", "ky", "la", "me", "md",
-    "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
-    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc",
-    "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc",
-}
+# Strict allowlist: only these states/abbreviations are accepted
+_ALLOWED_STATES = frozenset({
+    "maryland", "md",
+    "virginia", "va",
+    "washington dc", "district of columbia", "dc",
+    "northern virginia", "nova",
+})
 
-_US_MARKERS = {
-    "united states", "usa", "remote", "anywhere",
-    "work from home", "wfh", "us only", "north america",
-}
+# Strict allowlist: specific DC-metro / Maryland-area cities
+_ALLOWED_CITIES = frozenset({
+    "baltimore", "rockville", "bethesda", "silver spring", "gaithersburg",
+    "bowie", "annapolis", "mclean", "tysons", "tysons corner", "reston",
+    "herndon", "arlington", "alexandria", "fairfax", "chantilly", "sterling",
+    "manassas", "fort belvoir", "quantico", "laurel", "college park",
+    "greenbelt", "hyattsville", "fort meade",
+})
 
-# Preferred DC-metro / Maryland area locations — always accepted
-_PREFERRED_LOCATIONS = {
-    "maryland", "virginia", "washington dc", "district of columbia",
-    "northern virginia", "nova", "baltimore", "rockville", "bethesda",
-    "silver spring", "mclean", "tysons", "reston", "arlington",
-    "alexandria", "annapolis", "columbia", "germantown", "gaithersburg",
-    "bowie", "laurel", "greenbelt", "hyattsville", "chevy chase",
-}
+# Remote / work-from-home markers — always accepted
+_REMOTE_MARKERS = frozenset({
+    "remote", "work from home", "wfh", "anywhere", "us only",
+    "north america", "telecommute", "distributed",
+})
 
-# Substrings that confirm a location is clearly outside the US/Canada.
-# Only reject when one of these appears with NO competing US signal.
-_FOREIGN_MARKERS = {
-    "united kingdom", " uk,", "(uk)", "england", "scotland", "wales",
-    "london", "manchester", "birmingham",
-    "india", "bangalore", "mumbai", "hyderabad", "delhi", "chennai",
-    "australia", "sydney", "melbourne",
-    "germany", "berlin", "munich",
-    "france", "paris",
-    "netherlands", "amsterdam",
-    "ireland", "dublin",
-    "singapore",
-    "brazil", "são paulo",
-    "mexico", "mexico city",
-    "poland", "warsaw",
-    "ukraine", "kyiv",
-    "pakistan", "karachi", "lahore",
-    "philippines", "manila",
-    "nigeria", "lagos",
-    "kenya", "nairobi",
-    "japan", "tokyo",
-    "china", "beijing", "shanghai",
-    "new zealand", "auckland",
-    "south africa", "johannesburg",
-}
+# Bare country-level strings (no city) — treated as nationwide / remote-friendly
+_BARE_COUNTRY = frozenset({
+    "united states", "united states of america", "usa", "us",
+})
 
 
 def _is_us_or_remote(location, source=""):
     """
-    Pass remote jobs and US-based jobs (any state); only reject locations
-    that are clearly in a foreign country with no competing US signal.
-    Sources that are inherently US/remote (USAJobs, Remotive) always pass.
-    Unknown or unlisted locations pass through for the user to review.
+    Strict allowlist filter. A job passes only if its location is:
+      - From USAJobs or Remotive (always US/remote by nature)
+      - Unknown / empty / 'see listing' (passed through for manual review)
+      - Remote, Work From Home, WFH, or similar
+      - Bare "United States" or "USA" with no city specified
+      - Maryland, MD, Virginia, VA, Washington DC, DC, Northern Virginia, NoVA
+      - One of the specific DC-metro / Maryland-area cities listed in _ALLOWED_CITIES
+
+    Jobs located in any other US state or foreign country are rejected.
     """
     if source in ("USAJobs", "Remotive"):
         return True
     loc = location.lower().strip()
-    # Unknown / unlisted → let through
-    if not loc or loc in ("see listing", "worldwide", ""):
+    if not loc or loc == "see listing":
+        return True                          # unknown — let user judge
+    if any(m in loc for m in _REMOTE_MARKERS):
         return True
-    # Remote / work-from-home markers
-    if any(m in loc for m in _US_MARKERS):
-        return True
-    # Preferred DC-metro / Maryland area
-    if any(p in loc for p in _PREFERRED_LOCATIONS):
-        return True
-    # Any US state abbreviation as a standalone token (e.g. "Bethesda, MD")
-    tokens = re.split(r"[\s,/()]+", loc)
-    if any(t in _US_STATE_ABBREVS for t in tokens):
-        return True
-    # Reject only if a foreign marker appears AND no US signal is present
-    if any(f in loc for f in _FOREIGN_MARKERS):
-        return False
-    # Default: pass through — don't silently drop uncertain locations
-    return True
+    if loc in _BARE_COUNTRY:
+        return True                          # "United States" with no city
+    # Split on commas, pipes, slashes; check each component
+    parts = [p.strip() for p in re.split(r"[,/|]+", loc)]
+    for part in parts:
+        if part in _ALLOWED_STATES:
+            return True
+        # Check whether any allowed city name appears within the part
+        # (handles "Tysons Corner, VA" → part "tysons corner")
+        if any(city in part for city in _ALLOWED_CITIES):
+            return True
+        # Single-token state abbreviations: md, va, dc
+        for tok in part.split():
+            if tok in {"md", "va", "dc"}:
+                return True
+    return False                             # not in allowlist → reject
 
 
 # Title keywords that always pass regardless of the profile target_roles list
@@ -291,9 +277,12 @@ def search_jobs_adzuna(keywords, location="United States"):
 
 def search_jobs_jsearch(keywords):
     """
-    JSearch via RapidAPI — reliable aggregator covering LinkedIn, Indeed, Glassdoor, ZipRecruiter.
+    JSearch via RapidAPI — aggregates LinkedIn, Indeed, Glassdoor, ZipRecruiter.
     Free tier: 200 requests/month.  Sign up: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
     Set env: RAPIDAPI_KEY
+    Headers: X-RapidAPI-Key (API key), X-RapidAPI-Host (jsearch.p.rapidapi.com)
+    A 403 response means the key is invalid or not subscribed — all calls stop
+    immediately to avoid burning the rate-limit quota.
     """
     api_key = os.environ.get("RAPIDAPI_KEY")
     if not api_key:
@@ -322,8 +311,8 @@ def search_jobs_jsearch(keywords):
                 loc     = ", ".join(filter(None, [city, state, country])) or "See listing"
                 if job.get("job_is_remote"):
                     loc = f"Remote — {loc}" if loc != "See listing" else "Remote"
-                s_min = job.get("job_min_salary")
-                s_max = job.get("job_max_salary")
+                s_min  = job.get("job_min_salary")
+                s_max  = job.get("job_max_salary")
                 period = job.get("job_salary_period", "")
                 sal = ""
                 if s_min and s_max:
@@ -342,6 +331,14 @@ def search_jobs_jsearch(keywords):
                     tags        = job.get("job_employment_type", ""),
                 ))
             time.sleep(1)
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                print(
+                    f"  JSearch: 403 Forbidden — key rejected or not subscribed. "
+                    f"Verify RAPIDAPI_KEY at rapidapi.com/jsearch. Stopping all JSearch calls."
+                )
+                break          # stop immediately — don't burn remaining quota
+            print(f"  JSearch error ({kw}): HTTP {e.code}")
         except Exception as e:
             print(f"  JSearch error ({kw}): {e}")
     return found
@@ -350,8 +347,12 @@ def search_jobs_jsearch(keywords):
 def search_jobs_linkedin(keywords):
     """
     LinkedIn guest jobs API — public endpoint, no key required.
-    Parses the HTML fragment returned by LinkedIn's unauthenticated job search.
-    Note: LinkedIn may throttle heavy usage; results are best-effort.
+    Runs two passes:
+      1. The caller-supplied keywords (ServiceNow, ITSM, etc.)
+      2. A fixed set of BA-specific terms (Business Analyst, IT Business Analyst,
+         Systems Analyst) so pure BA roles are found even when no ServiceNow
+         keyword is in the list.
+    Results from both passes are combined and deduplicated by URL.
     """
     class _CardParser(HTMLParser):
         """Pull job-card fields out of a LinkedIn jobs HTML fragment."""
@@ -383,25 +384,39 @@ def search_jobs_linkedin(keywords):
                 self.jobs.append(dict(self._cur))
                 self._cur = {}
 
-    found = []
-    for kw in keywords[:4]:
+    def _fetch_linkedin_page(kw):
+        params = urllib.parse.urlencode({
+            "keywords": kw,
+            "location": "United States",
+            "start":    "0",
+            "count":    "25",
+        })
+        url    = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{params}"
+        html   = _fetch(url).decode("utf-8", errors="replace")
+        parser = _CardParser()
+        parser.feed(html)
+        return parser.jobs
+
+    # BA-specific terms always searched, regardless of what keywords are passed
+    _BA_KEYWORDS = ["Business Analyst", "IT Business Analyst", "Systems Analyst"]
+
+    # Combine passed keywords with BA terms, deduplicated, preserving order
+    all_kws    = list(dict.fromkeys(list(keywords[:4]) + _BA_KEYWORDS))
+    found      = []
+    seen_urls  = set()
+
+    for kw in all_kws:
         try:
-            params = urllib.parse.urlencode({
-                "keywords": kw,
-                "location": "United States",
-                "start":    "0",
-                "count":    "25",
-            })
-            url  = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{params}"
-            html = _fetch(url).decode("utf-8", errors="replace")
-            parser = _CardParser()
-            parser.feed(html)
-            for card in parser.jobs:
+            for card in _fetch_linkedin_page(kw):
+                url = card.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
                 found.append(_make_job(
                     title       = card.get("title", ""),
                     company     = card.get("company", ""),
                     location    = card.get("location", "See listing"),
-                    url         = card.get("url", ""),
+                    url         = url,
                     description = "",
                     posted      = card.get("posted", ""),
                     source      = "LinkedIn",
@@ -917,7 +932,7 @@ def run_daily_digest(profile):
 
     print(f"\n  Digest saved to : {digest_file}")
     print(f"  Full JSON saved : {FOUND_JOBS_FILE}")
-    display_jobs(new_jobs, max_show=10)
+    display_jobs(new_jobs)
     return new_jobs
 
 
