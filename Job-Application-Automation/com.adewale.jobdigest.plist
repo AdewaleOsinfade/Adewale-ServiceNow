@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    macOS LaunchAgent — Daily Job Digest
+    ─────────────────────────────────────
+    INSTALL (run these commands in Terminal):
+
+        # 1. Copy this file to LaunchAgents
+        cp /path/to/Job-Application-Automation/com.adewale.jobdigest.plist \
+           ~/Library/LaunchAgents/com.adewale.jobdigest.plist
+
+        # 2. Update the ProgramArguments path below to match your actual location
+        #    (replace /Users/adewale/... with your real path)
+
+        # 3. Load the agent (starts it for the current login session)
+        launchctl load ~/Library/LaunchAgents/com.adewale.jobdigest.plist
+
+    UNINSTALL:
+        launchctl unload ~/Library/LaunchAgents/com.adewale.jobdigest.plist
+        rm ~/Library/LaunchAgents/com.adewale.jobdigest.plist
+
+    CHECK STATUS:
+        launchctl list | grep adewale
+-->
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for this agent -->
+    <key>Label</key>
+    <string>com.adewale.jobdigest</string>
+
+    <!-- Command to run: bash run_digest.sh -->
+    <!-- UPDATE THIS PATH to match where your project lives on your Mac -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/adewale/Documents/Adewale-ServiceNow/Job-Application-Automation/run_digest.sh</string>
+    </array>
+
+    <!-- Run daily at 8:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- If the Mac was asleep at 8am, run as soon as it wakes up -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Redirect stdout and stderr to a log file -->
+    <!-- UPDATE THIS PATH too -->
+    <key>StandardOutPath</key>
+    <string>/Users/adewale/Documents/Adewale-ServiceNow/Job-Application-Automation/launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/adewale/Documents/Adewale-ServiceNow/Job-Application-Automation/launchd.log</string>
+
+    <!-- Keep environment variables available to the script -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/adewale</string>
+    </dict>
+</dict>
+</plist>
