@@ -12,14 +12,22 @@ MENU OPTIONS:
     [3] Daily digest — finds only NEW jobs since last run, saves jobs_YYYY-MM-DD.txt
     [4] View saved jobs from last search/digest
 
-OPTIONAL API KEYS (free — set as environment variables):
-    Adzuna  → https://developer.adzuna.com/
+API KEYS REQUIRED (all free — set as environment variables):
+
+    JSearch via RapidAPI  →  https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+        export RAPIDAPI_KEY=your_key              (free tier: 200 req/month)
+
+    Reed API              →  https://www.reed.co.uk/developers/jobseeker
+        export REED_API_KEY=your_key              (free registration)
+
+    USAJobs               →  https://developer.usajobs.gov/
+        export USAJOBS_API_KEY=your_key
+        export USAJOBS_USER_AGENT=your@email.com  (required by USAJobs)
+
+OPTIONAL API KEYS:
+    Adzuna  →  https://developer.adzuna.com/
         export ADZUNA_APP_ID=your_id
         export ADZUNA_APP_KEY=your_key
-
-    USAJobs → https://developer.usajobs.gov/ (also needs your email)
-        export USAJOBS_API_KEY=your_key
-        export USAJOBS_EMAIL=your@email.com
 
 OPTIONAL (LinkedIn Easy Apply automation only):
     pip install selenium
@@ -27,6 +35,7 @@ OPTIONAL (LinkedIn Easy Apply automation only):
     https://chromedriver.chromium.org/downloads
 """
 
+import base64
 import csv
 import hashlib
 import json
@@ -34,11 +43,11 @@ import os
 import re
 import time
 import webbrowser
-import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime, date
+from html.parser import HTMLParser
 
 
 PROFILE_FILE  = "profile.json"
@@ -80,27 +89,6 @@ def _make_job(title, company, location, url, description, posted,
     }
 
 
-def _parse_rss(data):
-    """Parse RSS/Atom XML bytes into a list of item dicts."""
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError:
-        return []
-    items = []
-    for item in root.iter("item"):
-        def t(tag):
-            el = item.find(tag)
-            return (el.text or "").strip() if el is not None else ""
-        items.append({
-            "title":       t("title"),
-            "link":        t("link"),
-            "description": re.sub(r"<[^>]+>", " ", t("description")),
-            "pubDate":     t("pubDate"),
-            "author":      t("author"),
-        })
-    return items
-
-
 def _parse_date(posted):
     """Normalize a posted date string to YYYY-MM-DD HH:MM:SS for sorting."""
     if not posted:
@@ -131,6 +119,52 @@ def _job_dedup_key(job):
     title   = re.sub(r"\W+", " ", job["title"].lower()).strip()
     company = re.sub(r"\W+", " ", job["company"].lower()).strip()
     return f"{title}||{company}"
+
+
+# US state abbreviations used by the location filter
+_US_STATE_ABBREVS = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga",
+    "hi", "id", "il", "in", "ia", "ks", "ky", "la", "me", "md",
+    "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
+    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc",
+    "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc",
+}
+
+_US_MARKERS = {
+    "united states", "usa", "remote", "anywhere",
+    "work from home", "wfh", "us only", "north america",
+}
+
+
+def _is_us_or_remote(location, source=""):
+    """
+    Return True if the job location is in the US or remote.
+    Sources that are inherently US/remote (USAJobs, Remotive) always pass.
+    Unknown/unlisted locations pass through so they are not silently dropped.
+    """
+    if source in ("USAJobs", "Remotive"):
+        return True
+    loc = location.lower().strip()
+    if not loc or loc in ("see listing", "worldwide", ""):
+        return True  # unknown — let the user see it and judge
+    if any(m in loc for m in _US_MARKERS):
+        return True
+    # "City, ST" patterns — check every token against state abbreviations
+    tokens = re.split(r"[\s,/]+", loc)
+    if any(t in _US_STATE_ABBREVS for t in tokens):
+        return True
+    return False
+
+
+def _matches_target_role(title, profile):
+    """
+    Return True if the job title contains at least one substring from
+    target_roles or titles in profile.json (case-insensitive).
+    """
+    prefs      = profile["job_preferences"]
+    all_roles  = prefs.get("target_roles", []) + prefs.get("titles", [])
+    title_low  = title.lower()
+    return any(role.lower() in title_low for role in all_roles)
 
 
 # ─── JOB SOURCES ────────────────────────────────────────────────────────────
@@ -199,60 +233,175 @@ def search_jobs_adzuna(keywords, location="United States"):
     return found
 
 
-def search_jobs_indeed_rss(keywords):
+def search_jobs_jsearch(keywords):
     """
-    Indeed RSS feed — free, no key needed.
-    URL: indeed.com/rss?q=KEYWORD&sort=date
-    Note: Indeed occasionally restricts RSS access; results may vary.
+    JSearch via RapidAPI — reliable aggregator covering LinkedIn, Indeed, Glassdoor, ZipRecruiter.
+    Free tier: 200 requests/month.  Sign up: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+    Set env: RAPIDAPI_KEY
     """
+    api_key = os.environ.get("RAPIDAPI_KEY")
+    if not api_key:
+        print("  JSearch: set RAPIDAPI_KEY env var (free at rapidapi.com/jsearch).")
+        return []
+
     found = []
+    headers = {
+        "X-RapidAPI-Key":  api_key,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+    }
     for kw in keywords[:4]:
         try:
-            q   = urllib.parse.quote(kw)
-            url = f"https://www.indeed.com/rss?q={q}&sort=date&limit=25"
-            data = _fetch(url)
-            for item in _parse_rss(data):
-                # Indeed RSS embeds company name in description as first <b> tag
-                company_match = re.search(r"<b>([^<]+)</b>", item.get("description", ""))
-                company = company_match.group(1).strip() if company_match else "See listing"
+            params = urllib.parse.urlencode({
+                "query":       f"{kw} United States",
+                "page":        "1",
+                "num_pages":   "1",
+                "date_posted": "month",
+            })
+            url  = f"https://jsearch.p.rapidapi.com/search?{params}"
+            data = json.loads(_fetch(url, headers=headers))
+            for job in data.get("data", []):
+                city    = job.get("job_city", "")
+                state   = job.get("job_state", "")
+                country = job.get("job_country", "")
+                loc     = ", ".join(filter(None, [city, state, country])) or "See listing"
+                if job.get("job_is_remote"):
+                    loc = f"Remote — {loc}" if loc != "See listing" else "Remote"
+                s_min = job.get("job_min_salary")
+                s_max = job.get("job_max_salary")
+                period = job.get("job_salary_period", "")
+                sal = ""
+                if s_min and s_max:
+                    sal = f"${float(s_min):,.0f} – ${float(s_max):,.0f} {period}".strip()
+                elif s_min:
+                    sal = f"${float(s_min):,.0f}+ {period}".strip()
                 found.append(_make_job(
-                    title       = item["title"],
-                    company     = company,
-                    location    = "See listing",
-                    url         = item["link"],
-                    description = item["description"],
-                    posted      = item["pubDate"],
-                    source      = "Indeed",
+                    title       = job.get("job_title", ""),
+                    company     = job.get("employer_name", ""),
+                    location    = loc,
+                    url         = job.get("job_apply_link", job.get("job_google_link", "")),
+                    description = job.get("job_description", ""),
+                    posted      = job.get("job_posted_at_datetime_utc", ""),
+                    source      = f"JSearch/{job.get('job_publisher', 'Aggregator')}",
+                    salary      = sal,
+                    tags        = job.get("job_employment_type", ""),
                 ))
-            time.sleep(1.2)
+            time.sleep(1)
         except Exception as e:
-            print(f"  Indeed RSS error ({kw}): {e}")
+            print(f"  JSearch error ({kw}): {e}")
     return found
 
 
-def search_jobs_dice_rss(keywords):
+def search_jobs_linkedin(keywords):
     """
-    Dice.com RSS feed — free, no key needed. Great for IT/tech BA roles.
+    LinkedIn guest jobs API — public endpoint, no key required.
+    Parses the HTML fragment returned by LinkedIn's unauthenticated job search.
+    Note: LinkedIn may throttle heavy usage; results are best-effort.
     """
+    class _CardParser(HTMLParser):
+        """Pull job-card fields out of a LinkedIn jobs HTML fragment."""
+        def __init__(self):
+            super().__init__()
+            self.jobs, self._cur, self._cap = [], {}, None
+
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs)
+            cls = d.get("class", "")
+            if tag == "a" and "base-card__full-link" in cls:
+                self._cur["url"] = d.get("href", "").split("?")[0]
+            elif tag == "h3" and "base-search-card__title" in cls:
+                self._cap = "title"
+            elif tag == "h4" and "base-search-card__subtitle" in cls:
+                self._cap = "company"
+            elif tag == "span" and "job-search-card__location" in cls:
+                self._cap = "location"
+            elif tag == "time":
+                self._cur["posted"] = d.get("datetime", "")
+
+        def handle_data(self, data):
+            if self._cap:
+                self._cur[self._cap] = data.strip()
+                self._cap = None
+
+        def handle_endtag(self, tag):
+            if tag == "li" and self._cur.get("title") and self._cur.get("url"):
+                self.jobs.append(dict(self._cur))
+                self._cur = {}
+
     found = []
     for kw in keywords[:4]:
         try:
-            q   = urllib.parse.quote(kw)
-            url = f"https://www.dice.com/jobs/q-{q}-l-remote/rss"
-            data = _fetch(url)
-            for item in _parse_rss(data):
+            params = urllib.parse.urlencode({
+                "keywords": kw,
+                "location": "United States",
+                "start":    "0",
+                "count":    "25",
+            })
+            url  = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{params}"
+            html = _fetch(url).decode("utf-8", errors="replace")
+            parser = _CardParser()
+            parser.feed(html)
+            for card in parser.jobs:
                 found.append(_make_job(
-                    title       = item["title"],
-                    company     = item.get("author", "See listing"),
-                    location    = "Remote",
-                    url         = item["link"],
-                    description = item["description"],
-                    posted      = item["pubDate"],
-                    source      = "Dice",
+                    title       = card.get("title", ""),
+                    company     = card.get("company", ""),
+                    location    = card.get("location", "See listing"),
+                    url         = card.get("url", ""),
+                    description = "",
+                    posted      = card.get("posted", ""),
+                    source      = "LinkedIn",
                 ))
-            time.sleep(1.2)
+            time.sleep(1.5)
         except Exception as e:
-            print(f"  Dice RSS error ({kw}): {e}")
+            print(f"  LinkedIn error ({kw}): {e}")
+    return found
+
+
+def search_jobs_reed(keywords):
+    """
+    Reed API — free, requires registration at https://www.reed.co.uk/developers/jobseeker
+    Uses HTTP Basic auth: username = API key, password = empty.
+    Set env: REED_API_KEY
+    """
+    api_key = os.environ.get("REED_API_KEY")
+    if not api_key:
+        print("  Reed: set REED_API_KEY env var (free at reed.co.uk/developers).")
+        return []
+
+    token   = base64.b64encode(f"{api_key}:".encode()).decode()
+    headers = {"Authorization": f"Basic {token}"}
+    found   = []
+
+    for kw in keywords[:4]:
+        try:
+            params = urllib.parse.urlencode({
+                "keywords":     kw,
+                "locationName": "United States",
+                "resultsToTake": 25,
+                "distanceFromLocation": 0,
+            })
+            url  = f"https://www.reed.co.uk/api/1.0/search?{params}"
+            data = json.loads(_fetch(url, headers=headers))
+            for job in data.get("results", []):
+                s_min = job.get("minimumSalary")
+                s_max = job.get("maximumSalary")
+                sal   = ""
+                if s_min and s_max:
+                    sal = f"${float(s_min):,.0f} – ${float(s_max):,.0f}"
+                elif s_min:
+                    sal = f"${float(s_min):,.0f}+"
+                found.append(_make_job(
+                    title       = job.get("jobTitle", ""),
+                    company     = job.get("employerName", ""),
+                    location    = job.get("locationName", "See listing"),
+                    url         = f"https://www.reed.co.uk/jobs/{job.get('jobId', '')}",
+                    description = job.get("jobDescription", ""),
+                    posted      = job.get("date", ""),
+                    source      = "Reed",
+                    salary      = sal,
+                ))
+            time.sleep(1)
+        except Exception as e:
+            print(f"  Reed error ({kw}): {e}")
     return found
 
 
@@ -296,42 +445,16 @@ def search_jobs_themuse(keywords):
     return found
 
 
-def search_jobs_simplyhired_rss(keywords):
-    """
-    SimplyHired RSS feed — free, no key needed.
-    """
-    found = []
-    for kw in keywords[:4]:
-        try:
-            q   = urllib.parse.quote(kw)
-            url = f"https://www.simplyhired.com/search?q={q}&l=remote&rss=1"
-            data = _fetch(url)
-            for item in _parse_rss(data):
-                found.append(_make_job(
-                    title       = item["title"],
-                    company     = "See listing",
-                    location    = "Remote",
-                    url         = item["link"],
-                    description = item["description"],
-                    posted      = item["pubDate"],
-                    source      = "SimplyHired",
-                ))
-            time.sleep(1.2)
-        except Exception as e:
-            print(f"  SimplyHired RSS error ({kw}): {e}")
-    return found
-
-
 def search_jobs_usajobs(keywords):
     """
     USAJobs API — free key from https://developer.usajobs.gov/
-    Set env: USAJOBS_API_KEY, USAJOBS_EMAIL
+    Set env: USAJOBS_API_KEY, USAJOBS_USER_AGENT (must be your email address)
     Great for government IT/BA positions with ServiceNow.
     """
-    api_key = os.environ.get("USAJOBS_API_KEY")
-    email   = os.environ.get("USAJOBS_EMAIL", "jobsearch@example.com")
+    api_key    = os.environ.get("USAJOBS_API_KEY")
+    user_agent = os.environ.get("USAJOBS_USER_AGENT", "")
     if not api_key:
-        print("  USAJobs: set USAJOBS_API_KEY env var (free at developer.usajobs.gov).")
+        print("  USAJobs: set USAJOBS_API_KEY + USAJOBS_USER_AGENT env vars (developer.usajobs.gov).")
         return []
     found = []
     for kw in keywords[:3]:
@@ -344,7 +467,7 @@ def search_jobs_usajobs(keywords):
             headers = {
                 "Authorization-Key": api_key,
                 "Host":              "data.usajobs.gov",
-                "User-Agent":        email,
+                "User-Agent":        user_agent,
             }
             data  = json.loads(_fetch(url, headers=headers))
             items = data.get("SearchResult", {}).get("SearchResultItems", [])
@@ -383,8 +506,12 @@ def search_jobs_usajobs(keywords):
 
 def filter_jobs(jobs, profile):
     """
-    Deduplicates by title+company, applies exclude/include filters,
-    salary-aware soft-exclude override, and sorts newest-first.
+    Four-gate filter applied in order:
+      1. Dedup by normalized title + company (cross-source)
+      2. Title must match at least one entry in target_roles or titles
+      3. Location must be United States or Remote
+      4. Exclude/include keyword rules with salary-aware soft-exclude override
+    Results are sorted newest-first, then by relevance score.
     """
     prefs      = profile["job_preferences"]
     salary_min = prefs.get("salary_min", 0)
@@ -399,18 +526,27 @@ def filter_jobs(jobs, profile):
     filtered  = []
 
     for job in jobs:
+        # Gate 1: cross-source deduplication
         key = _job_dedup_key(job)
         if key in seen_keys:
             continue
         seen_keys.add(key)
 
+        # Gate 2: title must match a target role or job title from profile
+        if not _matches_target_role(job["title"], profile):
+            continue
+
+        # Gate 3: location must be United States or Remote
+        if not _is_us_or_remote(job["location"], source=job.get("source", "")):
+            continue
+
         combined = f"{job['title']} {job['description']}".lower()
 
-        # Hard excludes — no salary override
+        # Gate 4a: hard excludes (intern/internship) — no salary override
         if any(ex in combined for ex in hard_excl):
             continue
 
-        # Check if salary is above the minimum (allows soft-exclude override)
+        # Gate 4b: check if salary clears the minimum (unlocks soft-exclude override)
         has_good_salary = False
         sal_nums = re.findall(r"\d[\d,]+", job.get("salary", "").replace(",", ""))
         if sal_nums:
@@ -420,11 +556,11 @@ def filter_jobs(jobs, profile):
             except ValueError:
                 pass
 
-        # Soft excludes — skip unless salary qualifies
+        # Gate 4c: soft excludes (junior/entry-level) — skip unless salary qualifies
         if not has_good_salary and any(ex in combined for ex in soft_excl):
             continue
 
-        # Score by how many alert/include keywords appear
+        # Score by how many alert/include keywords appear in title + description
         job["_score"]       = sum(1 for kw in include_kws if kw in combined)
         job["_posted_sort"] = _parse_date(job.get("posted", ""))
         filtered.append(job)
@@ -763,13 +899,13 @@ def _run_all_searches(profile, keywords):
     all_jobs = []
 
     sources = [
-        ("Remotive",    lambda: search_jobs_remotive(keywords[:5])),
-        ("Indeed RSS",  lambda: search_jobs_indeed_rss(keywords[:4])),
-        ("Dice RSS",    lambda: search_jobs_dice_rss(keywords[:4])),
-        ("The Muse",    lambda: search_jobs_themuse(keywords[:3])),
-        ("SimplyHired", lambda: search_jobs_simplyhired_rss(keywords[:4])),
-        ("Adzuna",      lambda: search_jobs_adzuna(keywords[:4], location)),
-        ("USAJobs",     lambda: search_jobs_usajobs(keywords[:3])),
+        ("Remotive",  lambda: search_jobs_remotive(keywords[:5])),
+        ("JSearch",   lambda: search_jobs_jsearch(keywords[:4])),
+        ("LinkedIn",  lambda: search_jobs_linkedin(keywords[:4])),
+        ("Reed",      lambda: search_jobs_reed(keywords[:4])),
+        ("The Muse",  lambda: search_jobs_themuse(keywords[:3])),
+        ("Adzuna",    lambda: search_jobs_adzuna(keywords[:4], location)),
+        ("USAJobs",   lambda: search_jobs_usajobs(keywords[:3])),
     ]
 
     for name, fn in sources:
