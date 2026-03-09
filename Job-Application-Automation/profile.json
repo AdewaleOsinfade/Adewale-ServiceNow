@@ -5,7 +5,8 @@
     "linkedin": "https://www.linkedin.com/in/adewale-osinfade-page",
     "github": "https://github.com/AdewaleOsinfade",
     "phone": "",
-    "location": "United States"
+    "location": "United States",
+    "resume_path": ""
   },
   "job_preferences": {
     "titles": [
@@ -16,13 +17,43 @@
       "ServiceNow Consultant",
       "IT Project Manager"
     ],
+    "target_roles": [
+      "Business Analyst",
+      "ServiceNow Business Analyst",
+      "ITSM Business Analyst",
+      "Systems Analyst",
+      "IT Business Analyst",
+      "Process Analyst",
+      "BA ServiceNow"
+    ],
     "keywords": [
       "ServiceNow",
       "ITSM",
       "Flow Designer",
       "ServiceNow Administration",
       "ITIL",
-      "IT Service Management"
+      "IT Service Management",
+      "Business Analyst",
+      "Systems Analyst"
+    ],
+    "alert_keywords": [
+      "ServiceNow",
+      "ITSM",
+      "Agile",
+      "SQL",
+      "Jira",
+      "remote",
+      "hybrid",
+      "Salesforce"
+    ],
+    "preferred_sites": [
+      "LinkedIn",
+      "Indeed",
+      "Dice",
+      "ZipRecruiter",
+      "Remotive",
+      "The Muse",
+      "USAJobs"
     ],
     "locations": [
       "Remote",
@@ -31,7 +62,8 @@
     "job_type": ["full-time", "contract"],
     "experience_level": ["mid-level", "senior"],
     "salary_min": 70000,
-    "exclude_keywords": ["intern", "junior", "entry-level"]
+    "exclude_keywords": ["intern", "internship", "junior", "entry-level"],
+    "include_keywords": ["remote", "hybrid", "ServiceNow", "ITSM", "Agile", "Jira", "SQL", "Salesforce", "Business Analyst", "ITIL"]
   },
   "skills": [
     "ServiceNow Administration",
@@ -45,10 +77,15 @@
     "Incident Management",
     "Service Catalog",
     "UI Policies",
-    "Client Scripts"
+    "Client Scripts",
+    "Business Analysis",
+    "Requirements Gathering",
+    "Process Improvement",
+    "Agile",
+    "ITIL"
   ],
   "certifications": [
     "CompTIA Security+"
   ],
-  "cover_letter_template": "Dear Hiring Manager,\n\nI am excited to apply for the {job_title} position at {company}. As a ServiceNow enthusiast with a background in IT service delivery and project management, I am confident in my ability to contribute meaningfully to your team.\n\nMy expertise includes ServiceNow administration, ITSM workflows, Flow Designer, and JavaScript scripting. I hold a CompTIA Security+ certification and have hands-on experience building automation workflows, incident auto-assignment systems, and dynamic form validation.\n\nI am eager to bring my problem-solving skills and passion for ServiceNow to {company}. I look forward to the opportunity to discuss how I can support your IT service management goals.\n\nBest regards,\nAdewale Osinfade\nAdewaleOsinfade@gmail.com\nhttps://www.linkedin.com/in/adewale-osinfade-page"
+  "cover_letter_template": "Dear Hiring Manager,\n\nI am excited to apply for the {job_title} position at {company}. As a ServiceNow enthusiast and business analyst with a background in IT service delivery and project management, I am confident in my ability to contribute meaningfully to your team.\n\nMy expertise includes ServiceNow administration, ITSM workflows, Flow Designer, and JavaScript scripting. I hold a CompTIA Security+ certification and have hands-on experience building automation workflows, incident auto-assignment systems, and dynamic form validation. I bring strong business analysis skills including requirements gathering, process mapping, and stakeholder communication.\n\nI am eager to bring my problem-solving skills and passion for ServiceNow to {company}. I look forward to the opportunity to discuss how I can support your IT service management goals.\n\nBest regards,\nAdewale Osinfade\nAdewaleOsinfade@gmail.com\nhttps://www.linkedin.com/in/adewale-osinfade-page"
 }

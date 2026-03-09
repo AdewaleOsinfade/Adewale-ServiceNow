@@ -1,92 +1,155 @@
 # Job Application Automation Tool
 
-Automated job search and application tracking tool tailored for **Adewale Osinfade** — a ServiceNow administrator and ITSM professional.
-
-## Features
-
-- **Job Search**: Searches multiple job boards (Remotive, Adzuna) for ServiceNow and ITSM roles
-- **Smart Filtering**: Excludes irrelevant listings (intern, entry-level, etc.)
-- **Cover Letter Generator**: Auto-fills personalized cover letters for each job
-- **Application Tracker**: Logs every application to a CSV file with date, company, and status
-- **Status Tracker**: Update application statuses (Applied → Interview → Offer, etc.)
-- **Export Reports**: Generate text-based summary reports of your job search
+Automated job search, application tracking, and browser-assisted applying — tailored for **Adewale Osinfade**, a ServiceNow administrator and Business Analyst professional.
 
 ---
 
-## Setup
+## Quick Start
 
-### 1. Requirements
-- Python 3.7+ (no third-party packages needed — uses only standard library)
+```bash
+cd Job-Application-Automation
+python job_searcher.py       # search & apply
+python tracker_viewer.py    # manage your application pipeline
+```
 
-### 2. Configure Your Profile
-Edit `profile.json` to update:
-- Personal details (phone number, location)
-- Job title preferences
-- Target keywords and locations
-- Cover letter template
+**Requirements:** Python 3.7+ only. No third-party packages needed except `selenium` (optional, for LinkedIn Easy Apply auto-fill).
 
-### 3. (Optional) Set Up Adzuna API
-Get a free API key from [https://developer.adzuna.com/](https://developer.adzuna.com/), then set environment variables:
+---
+
+## Menu Options (`job_searcher.py`)
+
+| Option | Description |
+|--------|-------------|
+| `[1]` | Search all sources and display results |
+| `[2]` | Search all sources + apply interactively (opens browser, saves cover letters) |
+| `[3]` | **Daily digest** — finds only NEW jobs since last run, saves `jobs_YYYY-MM-DD.txt` |
+| `[4]` | View / apply to saved jobs from the last search or digest |
+
+---
+
+## Job Sources
+
+| Source | API Key? | Specialty |
+|--------|----------|-----------|
+| Remotive | No | Remote tech jobs |
+| Indeed | No (RSS) | Broad job market |
+| Dice | No (RSS) | IT / tech BA roles |
+| The Muse | No | Mid/senior roles |
+| SimplyHired | No (RSS) | General market |
+| Adzuna | Yes (free) | US broad market |
+| USAJobs | Yes (free) | Government IT roles |
+
+### Optional API Keys (all free)
+
+**Adzuna** — get a key at https://developer.adzuna.com/
 ```bash
 export ADZUNA_APP_ID=your_app_id
 export ADZUNA_APP_KEY=your_app_key
 ```
 
+**USAJobs** — register at https://developer.usajobs.gov/
+```bash
+export USAJOBS_API_KEY=your_key
+export USAJOBS_EMAIL=your@email.com
+```
+
 ---
 
-## Usage
+## Features
 
-### Search for Jobs
-```bash
-cd Job-Application-Automation
-python job_searcher.py
+### Resume Support
+- Set `resume_path` in `profile.json` to your resume file path
+- Every time you log an application, it records whether your resume was attached (`Yes`/`No`)
+- The application checklist reminds you to attach it when applying
+
+### Smart Filtering
+- **Deduplicates** by title + company across all sources (same job from Indeed & Dice = one result)
+- **Hard excludes** `intern` / `internship` regardless of salary
+- **Soft excludes** `junior` / `entry-level` — but overridden if salary is above your `salary_min`
+- **Sorts** newest-first, with a ★ relevance score based on alert keywords
+- **Salary** shown when available
+
+### Interactive Applying
+For each job you can:
+- **[a]** Open in browser + save cover letter + log application
+- **[v]** Preview the auto-generated cover letter first
+- **[s]** Skip
+- **[q]** Quit the session
+
+**LinkedIn jobs** — optionally use Selenium to pre-fill name, email, and phone into the Easy Apply form, then pause for your review before submission.
+
+**All other sites** — opens the URL in your default browser and shows a checklist:
 ```
-Choose option `[1]` to search, or `[2]` to search and apply interactively.
-
-### Apply Interactively
-When applying interactively, for each job you can:
-- **[a]** Apply — generates a cover letter and logs the application
-- **[s]** Skip the listing
-- **[v]** Preview the cover letter before deciding
-- **[q]** Quit
-
-Cover letters are saved to the `cover_letters/` folder.
-
-### Track Your Applications
-```bash
-python tracker_viewer.py
+[ ] Attach resume     → /path/to/your/resume.pdf
+[ ] Paste cover letter → saved to cover_letters/ folder
+[ ] Verify name, email, phone
+[ ] Double-check requirements before submitting
 ```
-Options:
-- View all logged applications
-- View summary by status
-- Update an application's status (Applied, Interview, Offer, etc.)
-- Filter by status
-- Export a report
+
+### LinkedIn Easy Apply (Selenium)
+```bash
+pip install selenium
+# Download ChromeDriver: https://chromedriver.chromium.org/downloads
+```
+When you choose option `[2]` and encounter a LinkedIn job, you'll be prompted whether to use Selenium. It pre-fills contact fields and pauses for you to review before submitting.
+
+### Daily Digest Mode
+- Remembers every job it has shown you (stored in `seen_jobs.json`)
+- On subsequent runs it only surfaces **new** listings
+- Saves a readable `jobs_2026-03-09.txt` file with titles, companies, and links
+- Great for running on a schedule (cron, Task Scheduler)
+
+**Run on a schedule (Linux/Mac cron example):**
+```bash
+# Run daily at 8am, pipe output to a log
+0 8 * * * cd /path/to/Job-Application-Automation && python job_searcher.py <<< "3" >> digest.log 2>&1
+```
 
 ---
 
 ## Files
 
 | File | Description |
-|---|---|
-| `profile.json` | Your personal info, job preferences, and cover letter template |
-| `job_searcher.py` | Main script: search jobs and apply interactively |
-| `tracker_viewer.py` | View and manage your application history |
-| `applications.csv` | Auto-created log of all applications |
-| `found_jobs.json` | Cache of jobs from the last search |
-| `cover_letters/` | Auto-generated cover letters per application |
+|------|-------------|
+| `profile.json` | Your info, job preferences, resume path, cover letter template |
+| `job_searcher.py` | Main script — search, filter, apply, daily digest |
+| `tracker_viewer.py` | View and manage your application pipeline |
+| `applications.csv` | Auto-created log of every application |
+| `found_jobs.json` | Jobs from last search (used by option `[4]`) |
+| `seen_jobs.json` | Fingerprints of all previously surfaced jobs (daily digest) |
+| `cover_letters/` | Auto-generated cover letters per company/role |
+| `jobs_YYYY-MM-DD.txt` | Daily digest output files |
 
 ---
 
-## Job Sources
+## Configuring `profile.json`
 
-| Source | API Key Required | Best For |
-|---|---|---|
-| [Remotive](https://remotive.com) | No | Remote jobs |
-| [Adzuna](https://adzuna.com) | Yes (free) | US-based jobs |
+Key fields to fill in:
+
+```json
+{
+  "personal": {
+    "phone": "555-123-4567",
+    "resume_path": "/home/adewale/Documents/Adewale_Resume.pdf"
+  },
+  "job_preferences": {
+    "salary_min": 70000,
+    "keywords": ["ServiceNow", "ITSM", "Business Analyst", ...],
+    "target_roles": ["Business Analyst", "ServiceNow Business Analyst", ...],
+    "alert_keywords": ["ServiceNow", "ITSM", "Agile", "SQL", "Jira"],
+    "exclude_keywords": ["intern", "internship", "junior", "entry-level"]
+  }
+}
+```
 
 ---
 
-## Customization
+## Tracker Viewer (`tracker_viewer.py`)
 
-To add more job sources, add a new `search_jobs_<source>()` function in `job_searcher.py` and call it in `main()`. Each function should return a list of job dicts with keys: `title`, `company`, `location`, `url`, `description`, `posted`, `source`, `salary`, `tags`.
+| Option | Description |
+|--------|-------------|
+| `[1]` | View all logged applications |
+| `[2]` | Summary: count by status, source, and resume attachment rate |
+| `[3]` | Update status (Applied → Phone Screen → Interview → Offer/Rejected) |
+| `[4]` | Filter by status |
+| `[5]` | Export a full `application_report_YYYYMMDD_HHMM.txt` |
