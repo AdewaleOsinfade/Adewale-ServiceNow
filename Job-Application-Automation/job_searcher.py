@@ -14,9 +14,6 @@ MENU OPTIONS:
 
 API KEYS REQUIRED (all free — set as environment variables):
 
-    JSearch via RapidAPI  →  https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
-        export RAPIDAPI_KEY=your_key              (free tier: 200 req/month)
-
     Reed API              →  https://www.reed.co.uk/developers/jobseeker
         export REED_API_KEY=your_key              (free registration)
 
@@ -258,112 +255,51 @@ def search_jobs_remotive(keywords):
     return found
 
 
-def search_jobs_adzuna(keywords, location="United States"):
+def search_jobs_adzuna():
     """
     Adzuna API — free key from https://developer.adzuna.com/
     Set env: ADZUNA_APP_ID, ADZUNA_APP_KEY
+    Searches 'business analyst' and 'ServiceNow' in Maryland, US.
     """
     app_id  = os.environ.get("ADZUNA_APP_ID")
     app_key = os.environ.get("ADZUNA_APP_KEY")
     if not app_id or not app_key:
         print("  Adzuna: set ADZUNA_APP_ID + ADZUNA_APP_KEY env vars to enable.")
         return []
-    query = urllib.parse.quote(" ".join(keywords[:4]))
-    loc   = urllib.parse.quote(location)
-    url   = (
-        f"https://api.adzuna.com/v1/api/jobs/us/search/1"
-        f"?app_id={app_id}&app_key={app_key}&results_per_page=25"
-        f"&what={query}&where={loc}&content-type=application/json"
-    )
+
+    searches = [
+        ("business analyst", "maryland"),
+        ("ServiceNow",       "maryland"),
+    ]
     found = []
-    try:
-        data = json.loads(_fetch(url))
-        for job in data.get("results", []):
-            s_min = job.get("salary_min", "")
-            s_max = job.get("salary_max", "")
-            sal   = f"${float(s_min):,.0f} – ${float(s_max):,.0f}" if s_min and s_max else ""
-            found.append(_make_job(
-                title       = job.get("title", ""),
-                company     = job.get("company", {}).get("display_name", ""),
-                location    = job.get("location", {}).get("display_name", ""),
-                url         = job.get("redirect_url", ""),
-                description = job.get("description", ""),
-                posted      = job.get("created", ""),
-                source      = "Adzuna",
-                salary      = sal,
-            ))
-    except Exception as e:
-        print(f"  Adzuna error: {e}")
-    return found
-
-
-def search_jobs_jsearch(keywords):
-    """
-    JSearch via RapidAPI — aggregates LinkedIn, Indeed, Glassdoor, ZipRecruiter.
-    Free tier: 200 requests/month.  Sign up: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
-    Set env: RAPIDAPI_KEY
-    Headers: X-RapidAPI-Key (API key), X-RapidAPI-Host (jsearch.p.rapidapi.com)
-    A 403 response means the key is invalid or not subscribed — all calls stop
-    immediately to avoid burning the rate-limit quota.
-    """
-    api_key = os.environ.get("RAPIDAPI_KEY")
-    if not api_key:
-        print("  JSearch: set RAPIDAPI_KEY env var (free at rapidapi.com/jsearch).")
-        return []
-
-    found = []
-    headers = {
-        "X-RapidAPI-Key":  api_key,
-        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
-    }
-    for kw in keywords[:4]:
+    for query, loc in searches:
         try:
-            params = urllib.parse.urlencode({
-                "query":       f"{kw} United States",
-                "page":        "1",
-                "num_pages":   "1",
-                "date_posted": "month",
-            })
-            url  = f"https://jsearch.p.rapidapi.com/search?{params}"
-            data = json.loads(_fetch(url, headers=headers))
-            for job in data.get("data", []):
-                city    = job.get("job_city", "")
-                state   = job.get("job_state", "")
-                country = job.get("job_country", "")
-                loc     = ", ".join(filter(None, [city, state, country])) or "See listing"
-                if job.get("job_is_remote"):
-                    loc = f"Remote — {loc}" if loc != "See listing" else "Remote"
-                s_min  = job.get("job_min_salary")
-                s_max  = job.get("job_max_salary")
-                period = job.get("job_salary_period", "")
-                sal = ""
-                if s_min and s_max:
-                    sal = f"${float(s_min):,.0f} – ${float(s_max):,.0f} {period}".strip()
-                elif s_min:
-                    sal = f"${float(s_min):,.0f}+ {period}".strip()
+            url = (
+                f"https://api.adzuna.com/v1/api/jobs/us/search/1"
+                f"?app_id={app_id}&app_key={app_key}&results_per_page=25"
+                f"&what={urllib.parse.quote(query)}&where={urllib.parse.quote(loc)}"
+                f"&content-type=application/json"
+            )
+            data = json.loads(_fetch(url))
+            for job in data.get("results", []):
+                s_min = job.get("salary_min", "")
+                s_max = job.get("salary_max", "")
+                sal   = f"${float(s_min):,.0f} – ${float(s_max):,.0f}" if s_min and s_max else ""
                 found.append(_make_job(
-                    title       = job.get("job_title", ""),
-                    company     = job.get("employer_name", ""),
-                    location    = loc,
-                    url         = job.get("job_apply_link", job.get("job_google_link", "")),
-                    description = job.get("job_description", ""),
-                    posted      = job.get("job_posted_at_datetime_utc", ""),
-                    source      = f"JSearch/{job.get('job_publisher', 'Aggregator')}",
+                    title       = job.get("title", ""),
+                    company     = job.get("company", {}).get("display_name", ""),
+                    location    = job.get("location", {}).get("display_name", ""),
+                    url         = job.get("redirect_url", ""),
+                    description = job.get("description", ""),
+                    posted      = job.get("created", ""),
+                    source      = "Adzuna",
                     salary      = sal,
-                    tags        = job.get("job_employment_type", ""),
                 ))
             time.sleep(1)
-        except urllib.error.HTTPError as e:
-            if e.code == 403:
-                print(
-                    f"  JSearch: 403 Forbidden — key rejected or not subscribed. "
-                    f"Verify RAPIDAPI_KEY at rapidapi.com/jsearch. Stopping all JSearch calls."
-                )
-                break          # stop immediately — don't burn remaining quota
-            print(f"  JSearch error ({kw}): HTTP {e.code}")
         except Exception as e:
-            print(f"  JSearch error ({kw}): {e}")
+            print(f"  Adzuna error ({query}): {e}")
     return found
+
 
 
 def search_jobs_linkedin(keywords):
@@ -397,7 +333,9 @@ def search_jobs_linkedin(keywords):
                 self._cur["posted"] = d.get("datetime", "")
 
         def handle_data(self, data):
-            if self._cap:
+            # Skip whitespace-only nodes so nested tags (e.g. <a> inside <h4>)
+            # don't consume the capture slot before the real text arrives.
+            if self._cap and data.strip():
                 self._cur[self._cap] = data.strip()
                 self._cap = None
 
@@ -405,13 +343,15 @@ def search_jobs_linkedin(keywords):
             if tag == "li" and self._cur.get("title") and self._cur.get("url"):
                 self.jobs.append(dict(self._cur))
                 self._cur = {}
+                self._cap = None   # clear any dangling capture slot between cards
 
-    def _fetch_linkedin_page(kw):
+    def _fetch_linkedin_page(kw, location="Washington DC-Baltimore Area", start=0):
         params = urllib.parse.urlencode({
             "keywords": kw,
-            "location": "United States",
-            "start":    "0",
+            "location": location,
+            "start":    str(start),
             "count":    "25",
+            "f_TPR":    "r2592000",   # posted within last 30 days
         })
         url    = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{params}"
         html   = _fetch(url).decode("utf-8", errors="replace")
@@ -423,29 +363,33 @@ def search_jobs_linkedin(keywords):
     _BA_KEYWORDS = ["Business Analyst", "IT Business Analyst", "Systems Analyst"]
 
     # Combine passed keywords with BA terms, deduplicated, preserving order
-    all_kws    = list(dict.fromkeys(list(keywords[:4]) + _BA_KEYWORDS))
-    found      = []
-    seen_urls  = set()
+    all_kws   = list(dict.fromkeys(list(keywords[:4]) + _BA_KEYWORDS))
+    found     = []
+    seen_urls = set()
 
     for kw in all_kws:
-        try:
-            for card in _fetch_linkedin_page(kw):
-                url = card.get("url", "")
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                found.append(_make_job(
-                    title       = card.get("title", ""),
-                    company     = card.get("company", ""),
-                    location    = card.get("location", "See listing"),
-                    url         = url,
-                    description = "",
-                    posted      = card.get("posted", ""),
-                    source      = "LinkedIn",
-                ))
-            time.sleep(1.5)
-        except Exception as e:
-            print(f"  LinkedIn error ({kw}): {e}")
+        # Fetch 2 pages per keyword from the DC-Baltimore metro area so
+        # most results already pass the location filter (50 raw per keyword).
+        for start in (0, 25):
+            try:
+                for card in _fetch_linkedin_page(kw, start=start):
+                    url = card.get("url", "")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    found.append(_make_job(
+                        title       = card.get("title", ""),
+                        company     = card.get("company", ""),
+                        location    = card.get("location", "See listing"),
+                        url         = url,
+                        description = "",
+                        posted      = card.get("posted", ""),
+                        source      = "LinkedIn",
+                    ))
+                time.sleep(1.5)
+            except Exception as e:
+                print(f"  LinkedIn error ({kw} start={start}): {e}")
+                break   # don't try page 2 if page 1 failed
     return found
 
 
@@ -690,34 +634,73 @@ def search_jobs_weworkremotely():
     return found
 
 
-def search_jobs_dice_rss_dc():
+def search_jobs_dice():
     """
-    Dice.com RSS feed pre-filtered to Maryland / DC / Virginia.
-    Searches both 'business analyst' and 'ServiceNow' in the DC metro area.
-    Free, no key needed.
+    Dice.com job search — reads the Next.js __NEXT_DATA__ block embedded in
+    the public search page.  The old /rss endpoint was discontinued.
+    Searches 'business analyst' and 'ServiceNow' near Maryland/DC/VA (30 mi radius).
+    No API key required.
     """
-    rss_queries = [
-        ("business_analyst",  "Maryland%2C+DC%2C+Virginia"),
-        ("ServiceNow",        "Maryland%2C+DC%2C+Virginia"),
+    searches = [
+        ("business analyst", "Maryland, United States"),
+        ("ServiceNow",       "Maryland, United States"),
     ]
     found = []
-    for q, loc in rss_queries:
+    for query, location in searches:
         try:
-            url  = f"https://www.dice.com/jobs/q-{q}-l-{loc}/rss"
-            data = _fetch(url)
-            for item in _parse_rss_items(data):
+            params = urllib.parse.urlencode({
+                "q":          query,
+                "location":   location,
+                "country":    "US",
+                "radius":     "30",
+                "radiusUnit": "mi",
+                "page":       "1",
+                "pageSize":   "20",
+                "language":   "en",
+            })
+            url  = f"https://www.dice.com/jobs?{params}"
+            html = _fetch(url, headers={
+                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }).decode("utf-8", errors="replace")
+
+            # Dice embeds search state in a Next.js __NEXT_DATA__ JSON block
+            m = re.search(
+                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                html, re.DOTALL
+            )
+            if not m:
+                print(f"  Dice: embedded JSON not found for '{query}' — page may require JS rendering")
+                continue
+
+            nd = json.loads(m.group(1))
+            # Try several known data paths (Dice may change their frontend)
+            jobs_raw = (
+                nd.get("props", {}).get("pageProps", {})
+                  .get("initialState", {}).get("jobsState", {}).get("jobs", None)
+                or nd.get("props", {}).get("pageProps", {})
+                  .get("initialState", {}).get("jobs", {}).get("jobs", None)
+                or nd.get("props", {}).get("pageProps", {}).get("jobs", None)
+                or nd.get("props", {}).get("initialProps", {}).get("jobs", None)
+                or []
+            )
+            for job in jobs_raw:
+                job_id = job.get("id", "")
                 found.append(_make_job(
-                    title       = item["title"],
-                    company     = item.get("author", "See listing"),
-                    location    = "Maryland / DC / Virginia",
-                    url         = item["link"],
-                    description = item["description"],
-                    posted      = item["pubDate"],
+                    title       = job.get("title", ""),
+                    company     = job.get("advertiserName", "") or job.get("company", "See listing"),
+                    location    = job.get("location", "Maryland / DC / Virginia"),
+                    url         = (
+                        job.get("applyUrl", "")
+                        or (f"https://www.dice.com/job-detail/{job_id}" if job_id else "")
+                    ),
+                    description = job.get("jobDescription", ""),
+                    posted      = job.get("postedDate", "") or job.get("date", ""),
                     source      = "Dice",
                 ))
             time.sleep(1.2)
         except Exception as e:
-            print(f"  Dice RSS error ({q}): {e}")
+            print(f"  Dice error ({query}): {e}")
     return found
 
 
@@ -1447,20 +1430,17 @@ class ApplicationTracker:
 
 def _run_all_searches(profile, keywords):
     """Run all job source searches and return the combined raw results."""
-    prefs    = profile["job_preferences"]
-    location = (prefs.get("locations") or ["United States"])[0]
     all_jobs = []
 
     sources = [
         ("Remotive",       lambda: search_jobs_remotive(keywords[:5])),
         ("RemoteOK",       lambda: search_jobs_remoteok()),
         ("WeWorkRemotely", lambda: search_jobs_weworkremotely()),
-        ("Dice (DC/VA/MD)",lambda: search_jobs_dice_rss_dc()),
-        ("JSearch",        lambda: search_jobs_jsearch(keywords[:4])),
+        ("Dice (DC/VA/MD)",lambda: search_jobs_dice()),
         ("LinkedIn",       lambda: search_jobs_linkedin(keywords[:4])),
         ("Reed",           lambda: search_jobs_reed(keywords[:4])),
         ("The Muse",       lambda: search_jobs_themuse(keywords[:3])),
-        ("Adzuna",         lambda: search_jobs_adzuna(keywords[:4], location)),
+        ("Adzuna",         lambda: search_jobs_adzuna()),
         ("USAJobs",        lambda: search_jobs_usajobs(keywords[:3])),
     ]
 
