@@ -51,6 +51,7 @@ import platform
 import re
 import sqlite3
 import time
+import warnings
 import webbrowser
 import xml.etree.ElementTree as ET
 import urllib.request
@@ -58,6 +59,10 @@ import urllib.parse
 import urllib.error
 from datetime import datetime, date, timedelta
 from html.parser import HTMLParser
+
+# Suppress urllib3 SSL / OpenSSL version warnings (NotOpenSSLWarning, etc.)
+warnings.filterwarnings("ignore", category=Warning, module="urllib3")
+warnings.filterwarnings("ignore", message=".*OpenSSL.*", category=Warning)
 
 
 PROFILE_FILE    = "profile.json"
@@ -662,71 +667,728 @@ def search_jobs_weworkremotely():
 
 def search_jobs_dice():
     """
-    Dice.com job search — reads the Next.js __NEXT_DATA__ block embedded in
-    the public search page.  The old /rss endpoint was discontinued.
-    Searches 'business analyst' and 'ServiceNow' near Maryland/DC/VA (30 mi radius).
+    Dice.com — Playwright headless scraper (JS-rendered SPA).
+    Searches 'business analyst' and 'ServiceNow' in Maryland, Washington DC,
+    and Virginia using the 50-mile radius + last-3-days filter.
     No API key required.
     """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    # (query, url-encoded location label)
     searches = [
-        ("business analyst", "Maryland, United States"),
-        ("ServiceNow",       "Maryland, United States"),
+        ("business+analyst", "Maryland"),
+        ("business+analyst", "Washington%2C+DC"),
+        ("business+analyst", "Virginia"),
+        ("ServiceNow",       "Maryland"),
+        ("ServiceNow",       "Washington%2C+DC"),
+        ("ServiceNow",       "Virginia"),
     ]
-    found = []
-    for query, location in searches:
-        try:
-            params = urllib.parse.urlencode({
-                "q":          query,
-                "location":   location,
-                "country":    "US",
-                "radius":     "30",
-                "radiusUnit": "mi",
-                "page":       "1",
-                "pageSize":   "20",
-                "language":   "en",
-            })
-            url  = f"https://www.dice.com/jobs?{params}"
-            html = _fetch(url, headers={
-                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }).decode("utf-8", errors="replace")
+    found    = []
+    seen_fps = set()
 
-            # Dice embeds search state in a Next.js __NEXT_DATA__ JSON block
-            m = re.search(
-                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                html, re.DOTALL
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
             )
-            if not m:
-                print(f"  Dice: embedded JSON not found for '{query}' — page may require JS rendering")
-                continue
+        )
+        for query, location in searches:
+            url  = (
+                f"https://www.dice.com/jobs?q={query}"
+                f"&location={location}&radius=50&radiusUnit=mi"
+                f"&page=1&pageSize=20&filters.postedDate=THREE"
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _pw_dismiss_cookies(page)
 
-            nd = json.loads(m.group(1))
-            # Try several known data paths (Dice may change their frontend)
-            jobs_raw = (
-                nd.get("props", {}).get("pageProps", {})
-                  .get("initialState", {}).get("jobsState", {}).get("jobs", None)
-                or nd.get("props", {}).get("pageProps", {})
-                  .get("initialState", {}).get("jobs", {}).get("jobs", None)
-                or nd.get("props", {}).get("pageProps", {}).get("jobs", None)
-                or nd.get("props", {}).get("initialProps", {}).get("jobs", None)
-                or []
+                jobs_data = []
+
+                # Strategy 1 — data-cy card selectors (Dice uses data-cy attrs)
+                cards = page.query_selector_all(
+                    "[data-cy='card'], dhi-search-card, [data-testid='job-card']"
+                )
+                for card in cards:
+                    title_el = card.query_selector(
+                        "[data-cy='card-title-link'], a.card-title-link, "
+                        "[data-testid='job-title-link'], h5 a, h2 a"
+                    )
+                    comp_el  = card.query_selector(
+                        "[data-cy='card-company'], .company-name, "
+                        "[data-testid='company-name'], [class*='companyName']"
+                    )
+                    loc_el   = card.query_selector(
+                        "[data-cy='card-location'], .search-result-location, "
+                        "[data-testid='location'], [class*='location']"
+                    )
+                    date_el  = card.query_selector(
+                        "[data-cy='card-posted-date'], .posted-date, "
+                        "[data-testid='posted-date'], [class*='postedDate']"
+                    )
+                    if not title_el:
+                        continue
+                    title  = (title_el.inner_text() or "").strip()
+                    href   = title_el.get_attribute("href") or ""
+                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
+                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else ""
+                    posted = (date_el.inner_text()  or "").strip() if date_el  else ""
+                    if title and href:
+                        full_url = href if href.startswith("http") else f"https://www.dice.com{href}"
+                        jobs_data.append((title, comp, loc, full_url, posted))
+
+                # Strategy 2 — fallback: grab all job-title links directly
+                if not jobs_data:
+                    links = page.query_selector_all(
+                        "a.card-title-link, "
+                        "a[data-cy='card-title-link'], "
+                        "a[data-testid='job-title-link']"
+                    )
+                    for link in links:
+                        title = (link.inner_text() or "").strip()
+                        href  = link.get_attribute("href") or ""
+                        if title and href:
+                            full_url = href if href.startswith("http") else f"https://www.dice.com{href}"
+                            jobs_data.append((title, "", "", full_url, ""))
+
+                loc_label = location.replace("%2C+", ", ").replace("+", " ")
+                for title, comp, loc, job_url, posted in jobs_data:
+                    fp = hashlib.md5(f"{title}|{comp}|{job_url}".encode()).hexdigest()
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    found.append(_make_job(
+                        title       = title,
+                        company     = comp   or "See listing",
+                        location    = loc    or loc_label,
+                        url         = job_url,
+                        description = "",
+                        posted      = posted,
+                        source      = "Dice",
+                    ))
+
+            except Exception as e:
+                print(f"  Dice error ({query}/{location}): {e}")
+            finally:
+                page.close()
+            time.sleep(1)
+
+        browser.close()
+    return found
+
+
+# ─── PLAYWRIGHT JOB BOARD SCRAPERS ──────────────────────────────────────────
+
+def search_jobs_glassdoor():
+    """
+    Glassdoor — Playwright headless scraper.
+    Searches 'business analyst servicenow' in the Washington DC metro area
+    (locId=9 = Washington DC metro, locT=M = metro).
+    Also searches Maryland (locId=48, locT=S = state).
+    No API key required.
+    """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    searches = [
+        (
+            "https://www.glassdoor.com/Job/jobs.htm"
+            "?sc.keyword=business+analyst+servicenow"
+            "&locT=M&locId=9&radius=50",
+            "DC Metro"
+        ),
+        (
+            "https://www.glassdoor.com/Job/jobs.htm"
+            "?sc.keyword=business+analyst+servicenow"
+            "&locT=S&locId=48&radius=50",
+            "Maryland"
+        ),
+        (
+            "https://www.glassdoor.com/Job/jobs.htm"
+            "?sc.keyword=servicenow+administrator"
+            "&locT=M&locId=9&radius=50",
+            "DC Metro"
+        ),
+    ]
+    found    = []
+    seen_fps = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        for url, loc_label in searches:
+            page = ctx.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _pw_dismiss_cookies(page)
+
+                # Glassdoor job card selectors
+                cards = page.query_selector_all(
+                    "li[data-test='jobListing'], "
+                    "[class*='JobCard_jobCardContainer'], "
+                    "article[class*='JobCard']"
+                )
+                for card in cards:
+                    title_el  = card.query_selector(
+                        "[data-test='job-title'], a[class*='JobCard_seoLink'], "
+                        "a[class*='jobTitle'], h3 a, h2 a"
+                    )
+                    comp_el   = card.query_selector(
+                        "[data-test='employerName'], [class*='EmployerProfile'], "
+                        "[class*='employerName'], .employer-name"
+                    )
+                    loc_el    = card.query_selector(
+                        "[data-test='location'], [class*='jobLocation'], "
+                        "[class*='location'], .location"
+                    )
+                    sal_el    = card.query_selector(
+                        "[data-test='detailSalary'], [class*='salary'], "
+                        "[class*='Salary'], .salary-estimate"
+                    )
+                    if not title_el:
+                        continue
+                    title  = (title_el.inner_text() or "").strip()
+                    href   = title_el.get_attribute("href") or ""
+                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
+                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
+                    salary = (sal_el.inner_text()   or "").strip() if sal_el   else ""
+                    if not title:
+                        continue
+                    full_url = (
+                        href if href.startswith("http")
+                        else f"https://www.glassdoor.com{href}"
+                    )
+                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    found.append(_make_job(
+                        title       = title,
+                        company     = comp   or "See listing",
+                        location    = loc,
+                        url         = full_url,
+                        description = "",
+                        posted      = "",
+                        source      = "Glassdoor",
+                        salary      = salary,
+                    ))
+
+            except Exception as e:
+                print(f"  Glassdoor error ({loc_label}): {e}")
+            finally:
+                page.close()
+            time.sleep(2)
+
+        browser.close()
+    return found
+
+
+def search_jobs_ziprecruiter():
+    """
+    ZipRecruiter — Playwright headless scraper.
+    Searches 'business analyst servicenow' near Washington DC (50-mile radius).
+    No API key required.
+    """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    searches = [
+        (
+            "https://www.ziprecruiter.com/jobs-search"
+            "?search=business+analyst+servicenow"
+            "&location=Washington+DC&radius=50",
+            "Washington DC"
+        ),
+        (
+            "https://www.ziprecruiter.com/jobs-search"
+            "?search=servicenow+administrator"
+            "&location=Maryland&radius=50",
+            "Maryland"
+        ),
+        (
+            "https://www.ziprecruiter.com/jobs-search"
+            "?search=business+analyst+ITSM"
+            "&location=Washington+DC&radius=50",
+            "Washington DC"
+        ),
+    ]
+    found    = []
+    seen_fps = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
             )
-            for job in jobs_raw:
-                job_id = job.get("id", "")
-                found.append(_make_job(
-                    title       = job.get("title", ""),
-                    company     = job.get("advertiserName", "") or job.get("company", "See listing"),
-                    location    = job.get("location", "Maryland / DC / Virginia"),
-                    url         = (
-                        job.get("applyUrl", "")
-                        or (f"https://www.dice.com/job-detail/{job_id}" if job_id else "")
-                    ),
-                    description = job.get("jobDescription", ""),
-                    posted      = job.get("postedDate", "") or job.get("date", ""),
-                    source      = "Dice",
-                ))
-            time.sleep(1.2)
-        except Exception as e:
-            print(f"  Dice error ({query}): {e}")
+        )
+        for url, loc_label in searches:
+            page = ctx.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _pw_dismiss_cookies(page)
+
+                cards = page.query_selector_all(
+                    "article[data-job-id], "
+                    "[class*='job_result'], "
+                    "[class*='jobCard'], "
+                    "div[class*='JobCard']"
+                )
+                for card in cards:
+                    title_el = card.query_selector(
+                        "h2[class*='title'], a[class*='job_title'], "
+                        "h2 a, h3 a, [class*='jobTitle'] a"
+                    )
+                    comp_el  = card.query_selector(
+                        "[class*='company'], [class*='employer'], "
+                        "a[data-testid='company-name']"
+                    )
+                    loc_el   = card.query_selector(
+                        "[class*='location'], [data-testid='location']"
+                    )
+                    if not title_el:
+                        continue
+                    title    = (title_el.inner_text() or "").strip()
+                    href     = title_el.get_attribute("href") or ""
+                    if not href:
+                        parent = title_el.query_selector("xpath=ancestor::a[1]")
+                        href   = (parent.get_attribute("href") or "") if parent else ""
+                    comp  = (comp_el.inner_text()  or "").strip() if comp_el  else ""
+                    loc   = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
+                    if not title:
+                        continue
+                    full_url = href if href.startswith("http") else f"https://www.ziprecruiter.com{href}"
+                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    found.append(_make_job(
+                        title       = title,
+                        company     = comp   or "See listing",
+                        location    = loc,
+                        url         = full_url,
+                        description = "",
+                        posted      = "",
+                        source      = "ZipRecruiter",
+                    ))
+
+            except Exception as e:
+                print(f"  ZipRecruiter error ({loc_label}): {e}")
+            finally:
+                page.close()
+            time.sleep(2)
+
+        browser.close()
+    return found
+
+
+def search_jobs_monster():
+    """
+    Monster.com — Playwright headless scraper.
+    Searches BA + ServiceNow in DC area, posted within 14 days.
+    No API key required.
+    """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    searches = [
+        (
+            "https://www.monster.com/jobs/search"
+            "?q=business+analyst+servicenow"
+            "&where=Washington__2C-DC&radius=50&tm=14",
+            "Washington DC"
+        ),
+        (
+            "https://www.monster.com/jobs/search"
+            "?q=servicenow+administrator"
+            "&where=Maryland&radius=50&tm=14",
+            "Maryland"
+        ),
+        (
+            "https://www.monster.com/jobs/search"
+            "?q=business+analyst+ITSM"
+            "&where=Virginia&radius=50&tm=14",
+            "Virginia"
+        ),
+    ]
+    found    = []
+    seen_fps = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        )
+        for url, loc_label in searches:
+            page = ctx.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _pw_dismiss_cookies(page)
+
+                cards = page.query_selector_all(
+                    "[data-testid='JobCard'], "
+                    ".flex-row[class*='JobResultWrapper'], "
+                    "section[class*='card-content'], "
+                    "[class*='job-search-card']"
+                )
+                for card in cards:
+                    title_el = card.query_selector(
+                        "h3 a, h2 a, [class*='title'] a, "
+                        "[data-testid='jobTitle'], a[class*='job-title']"
+                    )
+                    comp_el  = card.query_selector(
+                        "[class*='company'], [data-testid='company'], "
+                        "span[class*='name']"
+                    )
+                    loc_el   = card.query_selector(
+                        "[class*='location'], [data-testid='location'], "
+                        "span[class*='location']"
+                    )
+                    date_el  = card.query_selector(
+                        "[class*='date'], time, [data-testid='date']"
+                    )
+                    if not title_el:
+                        continue
+                    title  = (title_el.inner_text() or "").strip()
+                    href   = title_el.get_attribute("href") or ""
+                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
+                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
+                    posted = (date_el.inner_text()  or "").strip() if date_el  else ""
+                    if not title:
+                        continue
+                    full_url = href if href.startswith("http") else f"https://www.monster.com{href}"
+                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    found.append(_make_job(
+                        title       = title,
+                        company     = comp   or "See listing",
+                        location    = loc,
+                        url         = full_url,
+                        description = "",
+                        posted      = posted,
+                        source      = "Monster",
+                    ))
+
+            except Exception as e:
+                print(f"  Monster error ({loc_label}): {e}")
+            finally:
+                page.close()
+            time.sleep(2)
+
+        browser.close()
+    return found
+
+
+def search_jobs_careerbuilder():
+    """
+    CareerBuilder — Playwright headless scraper.
+    Searches BA + ServiceNow in DC area, posted within 14 days.
+    No API key required.
+    """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    searches = [
+        (
+            "https://www.careerbuilder.com/jobs"
+            "?keywords=business+analyst+servicenow"
+            "&location=Washington+DC&radius=50&posted=14",
+            "Washington DC"
+        ),
+        (
+            "https://www.careerbuilder.com/jobs"
+            "?keywords=servicenow+administrator"
+            "&location=Maryland&radius=50&posted=14",
+            "Maryland"
+        ),
+        (
+            "https://www.careerbuilder.com/jobs"
+            "?keywords=business+analyst+ITSM"
+            "&location=Virginia&radius=50&posted=14",
+            "Virginia"
+        ),
+    ]
+    found    = []
+    seen_fps = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        )
+        for url, loc_label in searches:
+            page = ctx.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _pw_dismiss_cookies(page)
+
+                cards = page.query_selector_all(
+                    "[class*='data-results-content'], "
+                    "li[class*='job-listing'], "
+                    "[data-testid='job-card'], "
+                    ".col-full.head"
+                )
+                for card in cards:
+                    title_el = card.query_selector(
+                        "a[class*='show-for-medium'], "
+                        "a[data-testid='job-title'], "
+                        "h2 a, h3 a, .job-title a"
+                    )
+                    comp_el  = card.query_selector(
+                        "[class*='data-details'] span:first-child, "
+                        "[class*='company'], [data-testid='company']"
+                    )
+                    loc_el   = card.query_selector(
+                        "[class*='job-location'], [class*='location'], "
+                        "[data-testid='location']"
+                    )
+                    sal_el   = card.query_selector(
+                        "[class*='salary'], [data-testid='salary'], "
+                        ".job-pay"
+                    )
+                    if not title_el:
+                        continue
+                    title  = (title_el.inner_text() or "").strip()
+                    href   = title_el.get_attribute("href") or ""
+                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
+                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
+                    salary = (sal_el.inner_text()   or "").strip() if sal_el   else ""
+                    if not title:
+                        continue
+                    full_url = href if href.startswith("http") else f"https://www.careerbuilder.com{href}"
+                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    found.append(_make_job(
+                        title       = title,
+                        company     = comp   or "See listing",
+                        location    = loc,
+                        url         = full_url,
+                        description = "",
+                        posted      = "",
+                        source      = "CareerBuilder",
+                        salary      = salary,
+                    ))
+
+            except Exception as e:
+                print(f"  CareerBuilder error ({loc_label}): {e}")
+            finally:
+                page.close()
+            time.sleep(2)
+
+        browser.close()
+    return found
+
+
+def search_jobs_workday():
+    """
+    Workday career portals for major DC-area employers.
+    Scrapes Booz Allen Hamilton, Leidos, SAIC, and CACI for
+    Business Analyst and ServiceNow roles using Playwright headless.
+    No API key required.
+    """
+    if not _ensure_playwright():
+        return []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    # Each entry: (employer_label, base_url, search_keyword)
+    portals = [
+        (
+            "Booz Allen",
+            "https://boozallen.wd1.myworkdayjobs.com/candidate/jobBoard/External_Career_Site",
+            ["business analyst", "ServiceNow"],
+        ),
+        (
+            "Leidos",
+            "https://leidos.wd5.myworkdayjobs.com/External",
+            ["business analyst", "ServiceNow"],
+        ),
+        (
+            "SAIC",
+            "https://jobs.saic.com",
+            ["business analyst", "ServiceNow"],
+        ),
+        (
+            "CACI",
+            "https://caci.wd1.myworkdayjobs.com/External",
+            ["business analyst", "ServiceNow"],
+        ),
+    ]
+    found    = []
+    seen_fps = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+
+        for employer, base_url, keywords in portals:
+            for keyword in keywords:
+                ctx  = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                )
+                page = ctx.new_page()
+                try:
+                    page.goto(base_url, timeout=35000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(3000)
+                    _pw_dismiss_cookies(page)
+
+                    # ── Search via Workday search box ─────────────────────────
+                    search_box = page.query_selector(
+                        "[data-automation-id='searchBox'], "
+                        "input[placeholder*='Search'], "
+                        "input[aria-label*='Search'], "
+                        "input[type='search'], "
+                        "#keyword-input, input[name='q']"
+                    )
+                    if search_box:
+                        search_box.click()
+                        search_box.fill(keyword)
+                        page.keyboard.press("Enter")
+                        page.wait_for_timeout(3000)
+                    else:
+                        # Try appending keyword to URL for Workday portals
+                        sep = "&" if "?" in base_url else "?"
+                        kw_enc = urllib.parse.quote_plus(keyword)
+                        page.goto(
+                            f"{base_url}{sep}q={kw_enc}",
+                            timeout=30000,
+                            wait_until="domcontentloaded",
+                        )
+                        page.wait_for_timeout(3000)
+
+                    # ── Extract job listings ──────────────────────────────────
+                    # Workday standard selectors
+                    cards = page.query_selector_all(
+                        "li[class*='css-'] a[data-automation-id='jobPostingTitle'], "
+                        "[data-automation-id='jobFoundDescription'], "
+                        "li.css-1q2dra3, ul[class*='jobList'] li, "
+                        "[class*='jobCard'], .job-item"
+                    )
+
+                    # Workday often renders titles as direct links; grab them all
+                    if not cards:
+                        cards = page.query_selector_all(
+                            "a[data-automation-id='jobPostingTitle']"
+                        )
+                        for link in cards:
+                            title    = (link.inner_text() or "").strip()
+                            href     = link.get_attribute("href") or ""
+                            full_url = href if href.startswith("http") else f"{base_url}{href}"
+                            if not title:
+                                continue
+                            fp = hashlib.md5(f"{title}|{employer}|{full_url}".encode()).hexdigest()
+                            if fp in seen_fps:
+                                continue
+                            seen_fps.add(fp)
+                            found.append(_make_job(
+                                title       = title,
+                                company     = employer,
+                                location    = "MD / DC / VA",
+                                url         = full_url,
+                                description = keyword,
+                                posted      = "",
+                                source      = f"Workday ({employer})",
+                            ))
+                    else:
+                        for card in cards:
+                            title_el = card.query_selector(
+                                "a[data-automation-id='jobPostingTitle'], "
+                                "h3 a, h2 a, a[class*='jobTitle'], a"
+                            )
+                            loc_el   = card.query_selector(
+                                "dd[data-automation-id='locations'], "
+                                "[class*='location'], [data-automation-id='jobPostingLocation']"
+                            )
+                            date_el  = card.query_selector(
+                                "dd[data-automation-id='postedOn'], "
+                                "[class*='date'], time"
+                            )
+                            if not title_el:
+                                continue
+                            title    = (title_el.inner_text() or "").strip()
+                            href     = title_el.get_attribute("href") or ""
+                            loc      = (loc_el.inner_text()   or "").strip() if loc_el   else "MD / DC / VA"
+                            posted   = (date_el.inner_text()  or "").strip() if date_el  else ""
+                            full_url = href if href.startswith("http") else f"{base_url}{href}"
+                            if not title:
+                                continue
+                            fp = hashlib.md5(f"{title}|{employer}|{full_url}".encode()).hexdigest()
+                            if fp in seen_fps:
+                                continue
+                            seen_fps.add(fp)
+                            found.append(_make_job(
+                                title       = title,
+                                company     = employer,
+                                location    = loc,
+                                url         = full_url,
+                                description = keyword,
+                                posted      = posted,
+                                source      = f"Workday ({employer})",
+                            ))
+
+                except Exception as e:
+                    print(f"  Workday ({employer}/{keyword}): {e}")
+                finally:
+                    page.close()
+                    ctx.close()
+                time.sleep(2)
+
+        browser.close()
     return found
 
 
@@ -1062,6 +1724,61 @@ def _ensure_playwright():
     except Exception:
         pass
     return True
+
+
+def _pw_dismiss_cookies(page):
+    """
+    Click common cookie-consent / GDPR accept buttons if visible.
+    Tries text-based matching first, then attribute-based selectors.
+    Safe to call on any page — silently ignores misses.
+    """
+    accept_phrases = [
+        "Accept All", "Accept all", "Accept All Cookies",
+        "Accept Cookies", "Accept", "I Accept", "I Agree",
+        "Agree", "Agree & Continue", "OK", "Got it", "Close",
+    ]
+    for phrase in accept_phrases:
+        try:
+            btn = page.locator(f"button:has-text('{phrase}')").first
+            if btn.is_visible(timeout=600):
+                btn.click()
+                page.wait_for_timeout(500)
+                return
+        except Exception:
+            pass
+    for sel in [
+        "#onetrust-accept-btn-handler",
+        "[id*='accept-all']", "[id*='acceptAll']",
+        "[class*='accept-all']", "[class*='acceptAll']",
+        "button[aria-label*='ccept']",
+        "[data-testid*='cookie'] button",
+        ".cookie-consent button", ".gdpr-consent button",
+    ]:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(500)
+                return
+        except Exception:
+            pass
+
+
+def _pw_el_text(el, *selectors):
+    """
+    Try each CSS selector on a Playwright element handle; return first non-empty
+    inner_text match, or '' if nothing found.
+    """
+    for sel in selectors:
+        try:
+            child = el.query_selector(sel)
+            if child:
+                text = (child.inner_text() or "").strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return ""
 
 
 def playwright_autofill_apply(job, profile, cover_letter_text=""):
@@ -1758,21 +2475,31 @@ def _run_all_searches(profile, keywords):
     """Run all job source searches and return the combined raw results."""
     all_jobs = []
 
-    sources = [
-        ("Remotive",       lambda: search_jobs_remotive(keywords[:5])),
-        ("RemoteOK",       lambda: search_jobs_remoteok()),
-        ("WeWorkRemotely", lambda: search_jobs_weworkremotely()),
-        ("Dice (DC/VA/MD)",lambda: search_jobs_dice()),
-        ("LinkedIn",       lambda: search_jobs_linkedin(keywords[:4])),
-        ("Reed",           lambda: search_jobs_reed(keywords[:4])),
-        ("The Muse",       lambda: search_jobs_themuse(keywords[:3])),
-        ("Adzuna",         lambda: search_jobs_adzuna()),
-        ("USAJobs",        lambda: search_jobs_usajobs(keywords[:3])),
-        ("Google Jobs",    lambda: search_jobs_serpapi()),
+    # ── Standard API / RSS sources ───────────────────────────────────────────
+    api_sources = [
+        ("Remotive",        lambda: search_jobs_remotive(keywords[:5])),
+        ("RemoteOK",        lambda: search_jobs_remoteok()),
+        ("WeWorkRemotely",  lambda: search_jobs_weworkremotely()),
+        ("LinkedIn",        lambda: search_jobs_linkedin(keywords[:4])),
+        ("Reed",            lambda: search_jobs_reed(keywords[:4])),
+        ("The Muse",        lambda: search_jobs_themuse(keywords[:3])),
+        ("Adzuna",          lambda: search_jobs_adzuna()),
+        ("USAJobs",         lambda: search_jobs_usajobs(keywords[:3])),
+        ("Google Jobs",     lambda: search_jobs_serpapi()),
     ]
 
-    for name, fn in sources:
-        print(f"  [{name:<12}] ", end="", flush=True)
+    # ── Playwright JS-rendered sources ───────────────────────────────────────
+    pw_sources = [
+        ("Dice (DC/VA/MD)", lambda: search_jobs_dice()),
+        ("Glassdoor",       lambda: search_jobs_glassdoor()),
+        ("ZipRecruiter",    lambda: search_jobs_ziprecruiter()),
+        ("Monster",         lambda: search_jobs_monster()),
+        ("CareerBuilder",   lambda: search_jobs_careerbuilder()),
+        ("Workday Portals", lambda: search_jobs_workday()),
+    ]
+
+    for name, fn in api_sources + pw_sources:
+        print(f"  [{name:<16}] ", end="", flush=True)
         try:
             results = fn()
             print(f"{len(results)} results")
