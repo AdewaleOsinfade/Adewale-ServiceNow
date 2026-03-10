@@ -910,22 +910,18 @@ def save_cover_letter(profile, job, text=None):
 
 def _claude_analyze_job(job, profile):
     """
-    Call Claude API to:
-      • Score the job match 1-10 against the candidate's profile
-      • Generate a tailored cover letter using job-description keywords
-      • Suggest 2-3 talking points for the application
+    Call Claude API to score the job and explain the match.
 
-    Returns dict: {match_score, cover_letter, talking_points}
-    Falls back to template cover letter + score=0 if key is missing or call fails.
+    Sends only title, company, location, and a trimmed description (max 200 words)
+    to minimise token usage.  Uses claude-haiku-4-5-20251001 (cheapest model).
+
+    Returns dict: {match_score, bullet_points}
+    Falls back to {match_score: 0, bullet_points: []} if API key is absent or call fails.
     Set env: ANTHROPIC_API_KEY
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return {
-            "match_score":   0,
-            "cover_letter":  generate_cover_letter(profile, job),
-            "talking_points": [],
-        }
+        return {"match_score": 0, "bullet_points": []}
 
     try:
         import anthropic
@@ -938,58 +934,49 @@ def _claude_analyze_job(job, profile):
             )
             import anthropic
         except Exception as e:
-            print(f"  anthropic install failed: {e} — using template cover letter.")
-            return {
-                "match_score":   0,
-                "cover_letter":  generate_cover_letter(profile, job),
-                "talking_points": [],
-            }
+            print(f"  anthropic install failed: {e}")
+            return {"match_score": 0, "bullet_points": []}
 
-    personal = profile.get("personal", {})
-    prefs    = profile.get("job_preferences", {})
-    skills   = profile.get("skills", [])
-    exp      = profile.get("experience", [])
+    prefs  = profile.get("job_preferences", {})
+    skills = profile.get("skills", [])
 
-    prompt = f"""You are helping {personal.get('name', 'a candidate')} apply for a job.
+    # Trim description to 200 words to keep prompt small
+    raw_desc = (job.get("description") or "").split()
+    desc     = " ".join(raw_desc[:200]) + ("…" if len(raw_desc) > 200 else "")
 
-JOB POSTING:
+    prompt = f"""Score how well this job matches the candidate's profile.
+
+JOB:
 Title: {job['title']}
 Company: {job['company']}
 Location: {job['location']}
-Description: {job['description'] or '(no description available)'}
+Description: {desc or '(no description available)'}
 
-CANDIDATE PROFILE:
+CANDIDATE:
 Target roles: {', '.join(prefs.get('target_roles', []))}
-Skills: {', '.join(skills[:20]) if skills else '(see profile)'}
-Experience summary: {json.dumps(exp[:3], indent=2) if exp else '(see profile)'}
-Email: {personal.get('email', '')}
+Key skills: {', '.join(skills[:15]) if skills else '(see profile)'}
 
 Respond with ONLY valid JSON (no markdown fences), exactly these keys:
 {{
   "match_score": <integer 1-10>,
-  "cover_letter": "<3-paragraph cover letter, 200-250 words, using keywords from the job description>",
-  "talking_points": ["<specific point 1>", "<specific point 2>", "<specific point 3>"]
-}}"""
+  "bullet_points": ["<reason 1>", "<reason 2>", "<reason 3>"]
+}}
+bullet_points should be 2-3 concise bullets explaining why this job matches or doesn't match."""
 
     try:
         client  = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model      = "claude-opus-4-6",
-            max_tokens = 1200,
+            model      = "claude-haiku-4-5-20251001",
+            max_tokens = 300,
             messages   = [{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
-        # Strip markdown code fences if model adds them
         if raw.startswith("```"):
             raw = re.sub(r"```[a-z]*\n?", "", raw).strip().rstrip("`").strip()
         return json.loads(raw)
     except Exception as e:
-        print(f"  Claude API error: {e} — using template cover letter.")
-        return {
-            "match_score":   0,
-            "cover_letter":  generate_cover_letter(profile, job),
-            "talking_points": [],
-        }
+        print(f"  Claude API error: {e}")
+        return {"match_score": 0, "bullet_points": []}
 
 
 # ─── BROWSER & APPLY ────────────────────────────────────────────────────────
@@ -1536,16 +1523,16 @@ def interactive_apply(jobs, profile):
         if action in ("a", "v"):
             if use_claude:
                 print("  Analyzing with Claude...")
-            analysis     = _claude_analyze_job(job, profile)
-            match_score  = analysis.get("match_score", 0)
-            cover_text   = analysis.get("cover_letter") or generate_cover_letter(profile, job)
-            talking_pts  = analysis.get("talking_points", [])
+            analysis    = _claude_analyze_job(job, profile)
+            match_score = analysis.get("match_score", 0)
+            bullet_pts  = analysis.get("bullet_points", [])
+            cover_text  = generate_cover_letter(profile, job)
 
             if match_score:
                 print(f"  Match score : {match_score}/10")
-            if talking_pts:
-                print("  Talking pts :")
-                for pt in talking_pts:
+            if bullet_pts:
+                print("  Why it matches:")
+                for pt in bullet_pts:
                     print(f"    • {pt}")
 
         if action == "v":
