@@ -103,7 +103,10 @@ def _make_job(title, company, location, url, description, posted,
         "description": re.sub(r"<[^>]+>", " ", description)[:500],
         "posted":      posted,
         "source":      source,
-        "salary":      salary.strip() if salary else "Not listed",
+        "salary":      (salary.strip()
+                        if salary and str(salary).strip().lower() not in
+                           ("nan", "none", "nat", "n/a", "")
+                        else "Not listed"),
         "tags":        tags,
     }
 
@@ -582,222 +585,91 @@ def search_jobs_usajobs(keywords):
     return found
 
 
-def search_jobs_remoteok():
-    """
-    RemoteOK public JSON API — free, no key needed.
-    API: https://remoteok.com/api
-    The first element of the array is metadata and is skipped.
-    Only jobs tagged 'business-analyst', 'servicenow', 'itsm', or
-    'systems-analyst' are returned.
-    """
-    _TARGET_TAGS = {
-        "business-analyst", "business analyst",
-        "servicenow", "itsm", "systems-analyst", "systems analyst",
-        "it-analyst", "it analyst",
-    }
-    found = []
-    try:
-        data = json.loads(_fetch("https://remoteok.com/api"))
-        for job in data[1:]:                        # element 0 is metadata
-            tags_raw  = job.get("tags", [])
-            tags_norm = {t.lower() for t in tags_raw} | {t.lower().replace(" ", "-") for t in tags_raw}
-            if not (tags_norm & _TARGET_TAGS):
-                continue
-            sal_min = job.get("salary_min", "")
-            sal_max = job.get("salary_max", "")
-            sal = f"${int(sal_min):,} – ${int(sal_max):,}" if sal_min and sal_max else ""
-            epoch  = job.get("date", "")
-            posted = ""
-            if epoch:
-                try:
-                    posted = datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d")
-                except (ValueError, OSError):
-                    pass
-            job_id = job.get("id", "")
-            found.append(_make_job(
-                title       = job.get("position", ""),
-                company     = job.get("company", ""),
-                location    = "Remote",
-                url         = job.get("url") or f"https://remoteok.com/remote-jobs/{job_id}",
-                description = job.get("description", ""),
-                posted      = posted,
-                source      = "RemoteOK",
-                salary      = sal,
-                tags        = ", ".join(tags_raw),
-            ))
-    except Exception as e:
-        print(f"  RemoteOK error: {e}")
-    return found
-
-
-def search_jobs_weworkremotely():
-    """
-    We Work Remotely RSS feed — free, no key needed.
-    Feed: https://weworkremotely.com/remote-jobs.rss
-    Filters to titles containing Business Analyst, ServiceNow, ITSM,
-    Systems Analyst, or IT Analyst keywords.
-    WWR titles are usually formatted "Company: Job Title" — the company
-    name is split out from the title automatically.
-    """
-    _TARGET_KWS = {
-        "business analyst", "servicenow", "itsm",
-        "systems analyst", "it analyst", "business system",
-    }
-    found = []
-    try:
-        data = _fetch("https://weworkremotely.com/remote-jobs.rss")
-        for item in _parse_rss_items(data):
-            raw_title = item["title"]
-            if not any(kw in raw_title.lower() for kw in _TARGET_KWS):
-                continue
-            # "Company: Job Title" → split on first colon
-            if ": " in raw_title:
-                company, title = raw_title.split(": ", 1)
-            else:
-                company, title = "See listing", raw_title
-            found.append(_make_job(
-                title       = title.strip(),
-                company     = company.strip(),
-                location    = "Remote",
-                url         = item["link"],
-                description = item["description"],
-                posted      = item["pubDate"],
-                source      = "WeWorkRemotely",
-            ))
-    except Exception as e:
-        print(f"  WeWorkRemotely error: {e}")
-    return found
-
-
 def search_jobs_dice():
     """
-    Dice.com — Playwright headless scraper (JS-rendered SPA).
-    Searches 'business analyst' and 'ServiceNow' in Maryland, Washington DC,
-    and Virginia using the 50-mile radius + last-3-days filter.
-    Applies playwright-stealth to bypass bot detection.
-    No API key required.
+    Dice.com — uses Dice's internal search API directly, bypassing JS rendering.
+    API: job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search
+    No Playwright, no bot detection, no API key required.
+    Runs 6 searches: 2 terms × 3 DC-area locations.
     """
-    if not _ensure_playwright():
-        return []
-    _ensure_stealth()
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return []
+    _API_BASE = "https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
+    _API_KEY  = "1YAt0R9wBg4WfsF9VB7tI6olBBgMFKvR"
+    _HEADERS  = {
+        "x-api-key":      _API_KEY,
+        "User-Agent":     (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":         "application/json, text/plain, */*",
+        "Accept-Language":"en-US,en;q=0.9",
+        "Referer":        "https://www.dice.com/",
+        "Origin":         "https://www.dice.com",
+    }
 
     searches = [
-        ("business+analyst",               "Maryland"),
-        ("business+analyst",               "Washington%2C+DC"),
-        ("business+analyst",               "Virginia"),
-        ("ServiceNow+Business+Analyst",    "Maryland"),
-        ("ServiceNow+Business+Analyst",    "Washington%2C+DC"),
-        ("ServiceNow+Business+Analyst",    "Virginia"),
+        ("business analyst servicenow", "Washington DC"),
+        ("business analyst servicenow", "Maryland"),
+        ("business analyst servicenow", "Virginia"),
+        ("ITSM business analyst",       "Washington DC"),
+        ("ITSM business analyst",       "Maryland"),
+        ("ITSM business analyst",       "Virginia"),
     ]
     found    = []
     seen_fps = set()
 
-    with sync_playwright() as pw:
-        browser, ctx = _pw_stealth_ctx(pw)
-        for query, location in searches:
-            url = (
-                f"https://www.dice.com/jobs?q={query}"
-                f"&location={location}&radius=50&radiusUnit=mi"
-                f"&page=1&pageSize=20&filters.postedDate=THREE"
-            )
-            page = ctx.new_page()
-            try:
-                _pw_apply_stealth(page)
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-                # Wait specifically for Dice title links — up to 5 seconds
-                appeared = False
-                try:
-                    page.wait_for_selector(
-                        "[data-cy='card-title-link']",
-                        timeout=5000,
-                        state="attached",
-                    )
-                    appeared = True
-                except Exception:
-                    pass
-
-                # If cards didn't appear, scroll once to trigger lazy-load and retry
-                if not appeared:
-                    page.evaluate("window.scrollBy(0, 600)")
-                    page.wait_for_timeout(2000)
-                    try:
-                        page.wait_for_selector(
-                            "[data-cy='card-title-link']",
-                            timeout=3000,
-                            state="attached",
-                        )
-                    except Exception:
-                        pass
-
-                _pw_dismiss_cookies(page)
-                jobs_data = []
-
-                # Strategy 1 — data-cy card containers
-                cards = page.query_selector_all(
-                    "[data-cy='card'], dhi-search-card"
-                )
-                for card in cards:
-                    title_el = card.query_selector(
-                        "[data-cy='card-title-link'], a.card-title-link"
-                    )
-                    comp_el  = card.query_selector(
-                        "[data-cy='card-company'], [data-cy='search-result-company-name']"
-                    )
-                    loc_el   = card.query_selector(
-                        "[data-cy='card-location'], [data-cy='search-result-location']"
-                    )
-                    date_el  = card.query_selector(
-                        "[data-cy='card-posted-date'], [data-cy='card-posted']"
-                    )
-                    if not title_el:
-                        continue
-                    title  = (title_el.inner_text() or "").strip()
-                    href   = title_el.get_attribute("href") or ""
-                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
-                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else ""
-                    posted = (date_el.inner_text()  or "").strip() if date_el  else ""
-                    if title and href:
-                        full_url = href if href.startswith("http") else f"https://www.dice.com{href}"
-                        jobs_data.append((title, comp, loc, full_url, posted))
-
-                # Strategy 2 — grab all data-cy title links directly (flat fallback)
-                if not jobs_data:
-                    links = page.query_selector_all("[data-cy='card-title-link']")
-                    for link in links:
-                        title = (link.inner_text() or "").strip()
-                        href  = link.get_attribute("href") or ""
-                        if title and href:
-                            full_url = href if href.startswith("http") else f"https://www.dice.com{href}"
-                            jobs_data.append((title, "", "", full_url, ""))
-
-                loc_label = location.replace("%2C+", ", ").replace("+", " ")
-                for title, comp, loc, job_url, posted in jobs_data:
-                    fp = hashlib.md5(f"{title}|{comp}|{job_url}".encode()).hexdigest()
-                    if fp in seen_fps:
-                        continue
-                    seen_fps.add(fp)
-                    found.append(_make_job(
-                        title       = title,
-                        company     = comp   or "See listing",
-                        location    = loc    or loc_label,
-                        url         = job_url,
-                        description = "",
-                        posted      = posted,
-                        source      = "Dice",
-                    ))
-
-            except Exception as e:
-                print(f"  Dice error ({query}/{location}): {e}")
-            finally:
-                page.close()
+    for q, loc in searches:
+        params = urllib.parse.urlencode({
+            "q":                  q,
+            "location":           loc,
+            "radius":             "50",
+            "radiusUnit":         "miles",
+            "page":               "1",
+            "pageSize":           "20",
+            "filters.postedDate": "THREE",
+            "language":           "en",
+        })
+        url = f"{_API_BASE}?{params}"
+        try:
+            req  = urllib.request.Request(url, headers=_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"  Dice API error ({q}/{loc}): {e}")
             time.sleep(1)
+            continue
 
-        browser.close()
+        for job in data.get("data", []):
+            title   = (job.get("title") or "").strip()
+            comp    = (job.get("companyPageUrl") or "").strip()
+            # companyDisplayName is the reliable name field
+            comp    = (job.get("companyDisplayName") or
+                       job.get("hiringCompany", {}).get("name") or
+                       "See listing").strip()
+            job_loc = (job.get("location") or loc).strip()
+            job_url = (job.get("applyUrl") or
+                       f"https://www.dice.com/job-detail/{job.get('id','')}").strip()
+            posted  = (job.get("postedDate") or "")[:10]
+            salary  = (job.get("salary") or "").strip()
+
+            if not title:
+                continue
+            fp = hashlib.md5(f"{title}|{comp}|{job_url}".encode()).hexdigest()
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            found.append(_make_job(
+                title       = title,
+                company     = comp,
+                location    = job_loc,
+                url         = job_url,
+                description = (job.get("jobDescription") or "")[:500],
+                posted      = posted,
+                source      = "Dice",
+                salary      = salary,
+            ))
+        time.sleep(1)
+
     return found
 
 
@@ -836,26 +708,51 @@ def search_jobs_jobspy():
     except ImportError:
         return []
 
+    # Use full "City, State" format — Glassdoor rejects bare state/city names
     searches = [
-        ("Business Analyst ServiceNow", "Washington DC"),
-        ("ITSM Business Analyst",       "Washington DC"),
-        ("Business Analyst",            "Washington DC"),
-        ("Business Analyst ServiceNow", "Maryland"),
-        ("ITSM Business Analyst",       "Maryland"),
-        ("Business Analyst",            "Maryland"),
+        ("Business Analyst ServiceNow", "Washington, DC"),
+        ("ITSM Business Analyst",       "Washington, DC"),
+        ("Business Analyst",            "Washington, DC"),
+        ("Business Analyst ServiceNow", "Baltimore, MD"),
+        ("ITSM Business Analyst",       "Baltimore, MD"),
+        ("Business Analyst",            "Baltimore, MD"),
     ]
 
-    found    = []
+    found     = []
     seen_urls = set()
+
+    def _clean_salary(s_min, s_max, interval, raw_salary):
+        """Return a human-readable salary string, never 'nan' or empty floats."""
+        _nan = {"nan", "none", "nat", "", "n/a"}
+
+        def _valid_num(v):
+            try:
+                f = float(v)
+                import math
+                return not math.isnan(f) and f > 0
+            except (TypeError, ValueError):
+                return False
+
+        if _valid_num(s_min) and _valid_num(s_max):
+            sal = f"${float(s_min):,.0f} – ${float(s_max):,.0f}"
+            iv  = str(interval or "").strip().lower()
+            if iv and iv not in _nan:
+                sal += f" /{iv}"
+            return sal
+
+        raw = str(raw_salary or "").strip()
+        if raw.lower() not in _nan and raw:
+            return raw
+        return "Not listed"
 
     for search_term, location in searches:
         try:
             df = scrape_jobs(
-                site_name     = ["indeed", "glassdoor", "zip_recruiter"],
-                search_term   = search_term,
-                location      = location,
+                site_name      = ["indeed", "glassdoor", "zip_recruiter"],
+                search_term    = search_term,
+                location       = location,
                 results_wanted = 50,
-                hours_old     = 336,   # 14 days
+                hours_old      = 336,   # 14 days
                 country_indeed = "USA",
             )
         except Exception as e:
@@ -871,30 +768,26 @@ def search_jobs_jobspy():
                 continue
             seen_urls.add(url)
 
-            # Salary — combine min/max if present
-            s_min = row.get("min_amount", "")
-            s_max = row.get("max_amount", "")
-            interval = str(row.get("interval", "") or "")
-            if s_min and s_max:
-                salary = f"${float(s_min):,.0f} – ${float(s_max):,.0f}"
-                if interval:
-                    salary += f" /{interval}"
-            else:
-                salary = str(row.get("salary", "") or "").strip()
+            salary = _clean_salary(
+                row.get("min_amount"),
+                row.get("max_amount"),
+                row.get("interval"),
+                row.get("salary"),
+            )
 
             # Source label
             site = str(row.get("site", "") or "").strip()
             source_map = {
-                "indeed":       "Indeed",
-                "glassdoor":    "Glassdoor",
-                "zip_recruiter":"ZipRecruiter",
+                "indeed":        "Indeed",
+                "glassdoor":     "Glassdoor",
+                "zip_recruiter": "ZipRecruiter",
             }
             source = source_map.get(site.lower(), site.title() or "JobSpy")
 
-            # Posted date
+            # Posted date — skip NaT / None / nan
             posted = ""
             raw_date = row.get("date_posted") or row.get("date") or ""
-            if raw_date and str(raw_date) not in ("NaT", "None", "nan"):
+            if raw_date and str(raw_date).lower() not in ("nat", "none", "nan", ""):
                 posted = str(raw_date)[:10]
 
             found.append(_make_job(
@@ -1136,6 +1029,22 @@ def filter_jobs(jobs, profile):
     ]
     include_kws = [kw.lower() for kw in prefs.get("include_keywords", [])]
 
+    # Titles that signal a tech-implementation role we don't want UNLESS
+    # "Business Analyst" or "ITSM" also appears in the title.
+    _tech_role_excl = {
+        "developer", "software engineer", "lead engineer",
+        "devops", "architect", "engineer",
+    }
+
+    def _is_excluded_tech_title(title):
+        t = title.lower()
+        if not any(kw in t for kw in _tech_role_excl):
+            return False
+        # Keep if title also contains 'business analyst' or 'itsm'
+        if "business analyst" in t or "itsm" in t:
+            return False
+        return True
+
     seen_keys = set()
     filtered  = []
 
@@ -1149,6 +1058,10 @@ def filter_jobs(jobs, profile):
         if key in seen_keys:
             continue
         seen_keys.add(key)
+
+        # Gate 1b: exclude ServiceNow Developer / Engineer titles
+        if _is_excluded_tech_title(job["title"]):
+            continue
 
         # Gate 2: title must match a target role or job title from profile
         if not _matches_target_role(job["title"], profile):
@@ -2711,14 +2624,15 @@ def _gh_job_matches(title, location):
 def search_jobs_greenhouse():
     """
     Greenhouse public job board API (no key required).
-    Checks Deloitte, Accenture, Booz Allen, and MITRE for Business Analyst
+    Checks MITRE, Leidos, General Dynamics, ManTech, and ICF for Business Analyst
     and ServiceNow roles in DC/MD/VA/Remote locations.
     """
     boards = [
-        ("Deloitte",   "deloitte"),
-        ("Accenture",  "accenture"),
-        ("Booz Allen", "boozallen"),
-        ("MITRE",      "mitre"),
+        ("MITRE",             "mitre"),
+        ("Leidos",            "leidos"),
+        ("General Dynamics",  "generaldynamics"),
+        ("ManTech",           "mantech"),
+        ("ICF",               "icf"),
     ]
     found    = []
     seen_fps = set()
@@ -2780,11 +2694,14 @@ def _lever_job_matches(title, location, categories):
 def search_jobs_lever():
     """
     Lever public postings API (no key required).
-    Checks CGI and Guidehouse for Business Analyst roles in DC/MD/VA.
+    Checks Guidehouse, Noblis, Peraton, and Unison for Business Analyst roles
+    in DC/MD/VA locations.
     """
     companies = [
-        ("CGI",         "https://api.lever.co/v0/postings/cgi?mode=json"),
         ("Guidehouse",  "https://api.lever.co/v0/postings/guidehouse?mode=json"),
+        ("Noblis",      "https://api.lever.co/v0/postings/noblis?mode=json"),
+        ("Peraton",     "https://api.lever.co/v0/postings/peraton?mode=json"),
+        ("Unison",      "https://api.lever.co/v0/postings/unison?mode=json"),
     ]
     found    = []
     seen_fps = set()
@@ -2833,11 +2750,9 @@ def _run_all_searches(profile, keywords):
     """Run all job source searches and return the combined raw results."""
     all_jobs = []
 
-    # ── Standard API / RSS sources ───────────────────────────────────────────
+    # ── Standard API sources (no browser required) ───────────────────────────
     api_sources = [
         ("Remotive",           lambda: search_jobs_remotive(keywords[:5])),
-        ("RemoteOK",           lambda: search_jobs_remoteok()),
-        ("WeWorkRemotely",     lambda: search_jobs_weworkremotely()),
         ("LinkedIn",           lambda: search_jobs_linkedin(keywords[:4])),
         ("Reed",               lambda: search_jobs_reed(keywords[:4])),
         ("The Muse",           lambda: search_jobs_themuse(keywords[:3])),
@@ -2847,13 +2762,12 @@ def _run_all_searches(profile, keywords):
         ("Greenhouse Boards",  lambda: search_jobs_greenhouse()),
         ("Lever Boards",       lambda: search_jobs_lever()),
         ("Built In DC",        lambda: search_jobs_builtin()),
+        ("Dice",               lambda: search_jobs_dice()),
     ]
 
-    # ── JobSpy (Indeed + Glassdoor + ZipRecruiter, anti-detect) ─────────────
-    # ── Playwright JS-rendered sources ───────────────────────────────────────
+    # ── Sources that use anti-detect scraping (JobSpy) or Playwright ─────────
     pw_sources = [
         ("Indeed/GD/ZipR",    lambda: search_jobs_jobspy()),
-        ("Dice (DC/VA/MD)",   lambda: search_jobs_dice()),
         ("Workday Portals",   lambda: search_jobs_workday()),
     ]
 
