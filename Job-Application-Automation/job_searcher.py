@@ -1472,25 +1472,73 @@ def handle_apply(job, profile, cover_letter_text=""):
 
 # ─── DISPLAY ────────────────────────────────────────────────────────────────
 
-def display_jobs(jobs, max_show=None):
+def _job_category(job):
+    """Classify a job as ServiceNow, Business Analyst, or Other."""
+    title = job["title"].lower()
+    if "servicenow" in title or "service now" in title:
+        return "ServiceNow"
+    if any(x in title for x in (
+        "business analyst", "business system", "business systems",
+        "systems analyst", "process analyst", "it analyst"
+    )):
+        return "Business Analyst"
+    return "Other"
+
+
+def display_jobs(jobs, max_show=None, profile=None):
     if not jobs:
         print("\nNo matching jobs found.")
         return
-    limit = max_show or len(jobs)
+    limit     = max_show or len(jobs)
+    displayed = jobs[:limit]
+
+    # Score ★+ jobs via Claude (only if API key present and profile provided)
+    use_claude = profile and bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if use_claude:
+        to_score = [j for j in displayed
+                    if j.get("_score", 0) >= 1 and "_claude_score" not in j]
+        if to_score:
+            print(f"\n  Scoring {len(to_score)} starred job(s) with Claude...", flush=True)
+        for j in to_score:
+            result = _claude_analyze_job(j, profile)
+            j["_claude_score"]  = result.get("match_score", 0)
+            bullets             = result.get("bullet_points", [])
+            j["_claude_reason"] = bullets[0].strip() if bullets else ""
+
+    # Group jobs by category
+    groups = {"ServiceNow": [], "Business Analyst": [], "Other": []}
+    for job in displayed:
+        groups[_job_category(job)].append(job)
+
     print(f"\n{'='*65}")
     print(f"  {len(jobs)} job(s) found  (sorted: newest first, ★ = keyword match)")
     print(f"{'='*65}")
-    for i, job in enumerate(jobs[:limit], 1):
-        stars = "★" * min(job.get("_score", 0), 5)
-        print(f"\n[{i}] {job['title']}  {stars}")
-        print(f"    Company  : {job['company']}")
-        print(f"    Location : {job['location']}")
-        print(f"    Salary   : {job['salary']}")
-        print(f"    Source   : {job['source']}")
-        print(f"    Posted   : {job.get('posted', '')}")
-        print(f"    URL      : {job['url']}")
-        if job.get("tags"):
-            print(f"    Tags     : {job['tags']}")
+
+    counter = 1
+    for group_name in ("ServiceNow", "Business Analyst", "Other"):
+        group_jobs = groups[group_name]
+        if not group_jobs:
+            continue
+        sep = "─" * max(1, 52 - len(group_name))
+        print(f"\n  ── {group_name} Jobs {sep}")
+        for job in group_jobs:
+            stars = "★" * min(job.get("_score", 0), 5)
+            print(f"\n[{counter}] {job['title']}  {stars}")
+            print(f"    Company  : {job['company']}")
+            print(f"    Location : {job['location']}")
+            print(f"    Salary   : {job['salary']}")
+            print(f"    Source   : {job['source']}")
+            print(f"    Posted   : {job.get('posted', '')}")
+            print(f"    URL      : {job['url']}")
+            if job.get("tags"):
+                print(f"    Tags     : {job['tags']}")
+            cs = job.get("_claude_score", 0)
+            cr = job.get("_claude_reason", "")
+            if cs:
+                reason_str = f" — {cr}" if cr else ""
+                print(f"    Match Score : {cs}/10{reason_str}")
+            counter += 1
+
     if max_show and len(jobs) > max_show:
         print(f"\n  ... {len(jobs) - max_show} more job(s) not shown.")
 
@@ -1635,7 +1683,7 @@ def run_daily_digest(profile):
 
     print(f"\n  Digest saved to : {digest_file}")
     print(f"  Full JSON saved : {FOUND_JOBS_FILE}")
-    display_jobs(new_jobs)
+    display_jobs(new_jobs, profile=profile)
     return new_jobs
 
 
@@ -1760,7 +1808,7 @@ def main():
         if os.path.exists(FOUND_JOBS_FILE):
             with open(FOUND_JOBS_FILE) as f:
                 jobs = json.load(f)
-            display_jobs(jobs)
+            display_jobs(jobs, profile=profile)
             go = input("\n  [a] Apply interactively  [q] Quit: ").strip().lower()
             if go == "a":
                 interactive_apply(jobs, profile)
@@ -1784,7 +1832,7 @@ def main():
             json.dump(filtered, f, indent=2)
         print(f"  Saved to {FOUND_JOBS_FILE}")
 
-        display_jobs(filtered)
+        display_jobs(filtered, profile=profile)
 
         # ClearanceJobs has no public API — open a pre-filtered browser search
         open_clearancejobs_browser()
