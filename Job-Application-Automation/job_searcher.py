@@ -26,8 +26,7 @@ OPTIONAL API KEYS:
         export ADZUNA_APP_ID=your_id
         export ADZUNA_APP_KEY=your_key
 
-    Claude API  →  https://console.anthropic.com/  (tailored cover letters + match scoring)
-        export ANTHROPIC_API_KEY=your_key
+    Claude API  →  No longer used for scoring (removed to eliminate API costs)
 
     SerpAPI     →  https://serpapi.com/  (Google Jobs — 100 free searches/month)
         export SERPAPI_KEY=your_key
@@ -48,8 +47,11 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 import warnings
 import webbrowser
@@ -69,6 +71,8 @@ PROFILE_FILE    = "profile.json"
 TRACKER_DB      = "applications.db"
 FOUND_JOBS_FILE = "found_jobs.json"
 SEEN_JOBS_FILE  = "seen_jobs.json"
+EXCEL_FILE      = "jobs_export.xlsx"
+EXPORT_LOG_FILE = "export_log.json"
 
 _UA = "Mozilla/5.0 (compatible; JobSearchBot/1.0; +https://github.com/AdewaleOsinfade)"
 
@@ -299,8 +303,8 @@ def search_jobs_adzuna():
         return []
 
     searches = [
-        ("business analyst", "maryland"),
-        ("ServiceNow",       "maryland"),
+        ("business analyst",          "maryland"),
+        ("ServiceNow Business Analyst", "maryland"),
     ]
     found = []
     for query, loc in searches:
@@ -528,7 +532,7 @@ def search_jobs_usajobs(keywords):
         print("  USAJobs: set USAJOBS_API_KEY + USAJOBS_USER_AGENT env vars (developer.usajobs.gov).")
         return []
     # USAJobs titles match government job series names — use focused terms
-    usajobs_keywords = ["Business Analyst", "ServiceNow"]
+    usajobs_keywords = ["Business Analyst", "ServiceNow Business Analyst"]
     found = []
     for kw in usajobs_keywords:
         try:
@@ -670,70 +674,85 @@ def search_jobs_dice():
     Dice.com — Playwright headless scraper (JS-rendered SPA).
     Searches 'business analyst' and 'ServiceNow' in Maryland, Washington DC,
     and Virginia using the 50-mile radius + last-3-days filter.
+    Applies playwright-stealth to bypass bot detection.
     No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return []
 
-    # (query, url-encoded location label)
     searches = [
-        ("business+analyst", "Maryland"),
-        ("business+analyst", "Washington%2C+DC"),
-        ("business+analyst", "Virginia"),
-        ("ServiceNow",       "Maryland"),
-        ("ServiceNow",       "Washington%2C+DC"),
-        ("ServiceNow",       "Virginia"),
+        ("business+analyst",               "Maryland"),
+        ("business+analyst",               "Washington%2C+DC"),
+        ("business+analyst",               "Virginia"),
+        ("ServiceNow+Business+Analyst",    "Maryland"),
+        ("ServiceNow+Business+Analyst",    "Washington%2C+DC"),
+        ("ServiceNow+Business+Analyst",    "Virginia"),
     ]
     found    = []
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        browser, ctx = _pw_stealth_ctx(pw)
         for query, location in searches:
-            url  = (
+            url = (
                 f"https://www.dice.com/jobs?q={query}"
                 f"&location={location}&radius=50&radiusUnit=mi"
                 f"&page=1&pageSize=20&filters.postedDate=THREE"
             )
             page = ctx.new_page()
             try:
+                _pw_apply_stealth(page)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                _pw_dismiss_cookies(page)
 
+                # Wait specifically for Dice title links — up to 5 seconds
+                appeared = False
+                try:
+                    page.wait_for_selector(
+                        "[data-cy='card-title-link']",
+                        timeout=5000,
+                        state="attached",
+                    )
+                    appeared = True
+                except Exception:
+                    pass
+
+                # If cards didn't appear, scroll once to trigger lazy-load and retry
+                if not appeared:
+                    page.evaluate("window.scrollBy(0, 600)")
+                    page.wait_for_timeout(2000)
+                    try:
+                        page.wait_for_selector(
+                            "[data-cy='card-title-link']",
+                            timeout=3000,
+                            state="attached",
+                        )
+                    except Exception:
+                        pass
+
+                _pw_dismiss_cookies(page)
                 jobs_data = []
 
-                # Strategy 1 — data-cy card selectors (Dice uses data-cy attrs)
+                # Strategy 1 — data-cy card containers
                 cards = page.query_selector_all(
-                    "[data-cy='card'], dhi-search-card, [data-testid='job-card']"
+                    "[data-cy='card'], dhi-search-card"
                 )
                 for card in cards:
                     title_el = card.query_selector(
-                        "[data-cy='card-title-link'], a.card-title-link, "
-                        "[data-testid='job-title-link'], h5 a, h2 a"
+                        "[data-cy='card-title-link'], a.card-title-link"
                     )
                     comp_el  = card.query_selector(
-                        "[data-cy='card-company'], .company-name, "
-                        "[data-testid='company-name'], [class*='companyName']"
+                        "[data-cy='card-company'], [data-cy='search-result-company-name']"
                     )
                     loc_el   = card.query_selector(
-                        "[data-cy='card-location'], .search-result-location, "
-                        "[data-testid='location'], [class*='location']"
+                        "[data-cy='card-location'], [data-cy='search-result-location']"
                     )
                     date_el  = card.query_selector(
-                        "[data-cy='card-posted-date'], .posted-date, "
-                        "[data-testid='posted-date'], [class*='postedDate']"
+                        "[data-cy='card-posted-date'], [data-cy='card-posted']"
                     )
                     if not title_el:
                         continue
@@ -746,13 +765,9 @@ def search_jobs_dice():
                         full_url = href if href.startswith("http") else f"https://www.dice.com{href}"
                         jobs_data.append((title, comp, loc, full_url, posted))
 
-                # Strategy 2 — fallback: grab all job-title links directly
+                # Strategy 2 — grab all data-cy title links directly (flat fallback)
                 if not jobs_data:
-                    links = page.query_selector_all(
-                        "a.card-title-link, "
-                        "a[data-cy='card-title-link'], "
-                        "a[data-testid='job-title-link']"
-                    )
+                    links = page.query_selector_all("[data-cy='card-title-link']")
                     for link in links:
                         title = (link.inner_text() or "").strip()
                         href  = link.get_attribute("href") or ""
@@ -790,19 +805,24 @@ def search_jobs_dice():
 
 def search_jobs_glassdoor():
     """
-    Glassdoor — Playwright headless scraper.
-    Searches 'business analyst servicenow' in the Washington DC metro area
-    (locId=9 = Washington DC metro, locT=M = metro).
-    Also searches Maryland (locId=48, locT=S = state).
-    No API key required.
+    Glassdoor — Playwright headless scraper with stealth.
+    Runs 5 targeted searches so results aren't limited to ~5 listings:
+      1. 'business analyst servicenow' — DC metro (locId=9)
+      2. 'business analyst servicenow DC' — DC metro
+      3. 'business analyst' — Maryland (locId=48, state)
+      4. 'ITSM analyst' — Virginia (locId=46, state)
+      5. 'servicenow administrator' — DC metro
+    Deduplicates across all searches.  No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return []
 
+    # (url, display label for fallback location)
     searches = [
         (
             "https://www.glassdoor.com/Job/jobs.htm"
@@ -812,13 +832,25 @@ def search_jobs_glassdoor():
         ),
         (
             "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=business+analyst+servicenow"
+            "?sc.keyword=business+analyst+servicenow+DC"
+            "&locT=M&locId=9&radius=50",
+            "DC Metro"
+        ),
+        (
+            "https://www.glassdoor.com/Job/jobs.htm"
+            "?sc.keyword=business+analyst"
             "&locT=S&locId=48&radius=50",
             "Maryland"
         ),
         (
             "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=servicenow+administrator"
+            "?sc.keyword=ITSM+analyst"
+            "&locT=S&locId=46&radius=50",
+            "Virginia"
+        ),
+        (
+            "https://www.glassdoor.com/Job/jobs.htm"
+            "?sc.keyword=servicenow+business+analyst"
             "&locT=M&locId=9&radius=50",
             "DC Metro"
         ),
@@ -827,44 +859,51 @@ def search_jobs_glassdoor():
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-        )
+        browser, ctx = _pw_stealth_ctx(pw)
         for url, loc_label in searches:
             page = ctx.new_page()
             try:
+                _pw_apply_stealth(page)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
                 _pw_dismiss_cookies(page)
+                _pw_human_mouse(page)
 
-                # Glassdoor job card selectors
+                # Try to wait for job listings to appear
+                try:
+                    page.wait_for_selector(
+                        "li[data-test='jobListing'], [class*='JobCard']",
+                        timeout=5000,
+                        state="attached",
+                    )
+                except Exception:
+                    pass
+
                 cards = page.query_selector_all(
                     "li[data-test='jobListing'], "
                     "[class*='JobCard_jobCardContainer'], "
-                    "article[class*='JobCard']"
+                    "article[class*='JobCard'], "
+                    "[class*='job-search-key']"
                 )
                 for card in cards:
-                    title_el  = card.query_selector(
-                        "[data-test='job-title'], a[class*='JobCard_seoLink'], "
+                    title_el = card.query_selector(
+                        "[data-test='job-title'], "
+                        "a[class*='JobCard_seoLink'], "
                         "a[class*='jobTitle'], h3 a, h2 a"
                     )
-                    comp_el   = card.query_selector(
-                        "[data-test='employerName'], [class*='EmployerProfile'], "
-                        "[class*='employerName'], .employer-name"
+                    comp_el  = card.query_selector(
+                        "[data-test='employerName'], "
+                        "[class*='EmployerProfile'], "
+                        "[class*='employerName']"
                     )
-                    loc_el    = card.query_selector(
-                        "[data-test='location'], [class*='jobLocation'], "
-                        "[class*='location'], .location"
+                    loc_el   = card.query_selector(
+                        "[data-test='location'], "
+                        "[class*='jobLocation'], "
+                        "[class*='JobCard_location']"
                     )
-                    sal_el    = card.query_selector(
-                        "[data-test='detailSalary'], [class*='salary'], "
-                        "[class*='Salary'], .salary-estimate"
+                    sal_el   = card.query_selector(
+                        "[data-test='detailSalary'], "
+                        "[class*='salary'], [class*='Salary']"
                     )
                     if not title_el:
                         continue
@@ -875,10 +914,7 @@ def search_jobs_glassdoor():
                     salary = (sal_el.inner_text()   or "").strip() if sal_el   else ""
                     if not title:
                         continue
-                    full_url = (
-                        href if href.startswith("http")
-                        else f"https://www.glassdoor.com{href}"
-                    )
+                    full_url = href if href.startswith("http") else f"https://www.glassdoor.com{href}"
                     fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
                     if fp in seen_fps:
                         continue
@@ -906,12 +942,13 @@ def search_jobs_glassdoor():
 
 def search_jobs_ziprecruiter():
     """
-    ZipRecruiter — Playwright headless scraper.
-    Searches 'business analyst servicenow' near Washington DC (50-mile radius).
+    ZipRecruiter — Playwright headless scraper with stealth + human-like headers.
+    Searches BA + ServiceNow Business Analyst near Washington DC / Maryland.
     No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -926,7 +963,7 @@ def search_jobs_ziprecruiter():
         ),
         (
             "https://www.ziprecruiter.com/jobs-search"
-            "?search=servicenow+administrator"
+            "?search=servicenow+business+analyst"
             "&location=Maryland&radius=50",
             "Maryland"
         ),
@@ -941,20 +978,15 @@ def search_jobs_ziprecruiter():
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        browser, ctx = _pw_stealth_ctx(pw)
         for url, loc_label in searches:
             page = ctx.new_page()
             try:
+                _pw_apply_stealth(page)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
                 _pw_dismiss_cookies(page)
+                _pw_human_mouse(page)
 
                 cards = page.query_selector_all(
                     "article[data-job-id], "
@@ -976,13 +1008,16 @@ def search_jobs_ziprecruiter():
                     )
                     if not title_el:
                         continue
-                    title    = (title_el.inner_text() or "").strip()
-                    href     = title_el.get_attribute("href") or ""
+                    title = (title_el.inner_text() or "").strip()
+                    href  = title_el.get_attribute("href") or ""
                     if not href:
-                        parent = title_el.query_selector("xpath=ancestor::a[1]")
-                        href   = (parent.get_attribute("href") or "") if parent else ""
-                    comp  = (comp_el.inner_text()  or "").strip() if comp_el  else ""
-                    loc   = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
+                        try:
+                            anc  = title_el.evaluate("el => el.closest('a')?.href || ''")
+                            href = anc or ""
+                        except Exception:
+                            pass
+                    comp = (comp_el.inner_text() or "").strip() if comp_el else ""
+                    loc  = (loc_el.inner_text()  or "").strip() if loc_el  else loc_label
                     if not title:
                         continue
                     full_url = href if href.startswith("http") else f"https://www.ziprecruiter.com{href}"
@@ -1012,12 +1047,13 @@ def search_jobs_ziprecruiter():
 
 def search_jobs_monster():
     """
-    Monster.com — Playwright headless scraper.
-    Searches BA + ServiceNow in DC area, posted within 14 days.
+    Monster.com — Playwright headless scraper with stealth.
+    Searches BA + ServiceNow Business Analyst in DC area, posted within 14 days.
     No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1032,7 +1068,7 @@ def search_jobs_monster():
         ),
         (
             "https://www.monster.com/jobs/search"
-            "?q=servicenow+administrator"
+            "?q=servicenow+business+analyst"
             "&where=Maryland&radius=50&tm=14",
             "Maryland"
         ),
@@ -1047,20 +1083,15 @@ def search_jobs_monster():
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        browser, ctx = _pw_stealth_ctx(pw)
         for url, loc_label in searches:
             page = ctx.new_page()
             try:
+                _pw_apply_stealth(page)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
                 _pw_dismiss_cookies(page)
+                _pw_human_mouse(page)
 
                 cards = page.query_selector_all(
                     "[data-testid='JobCard'], "
@@ -1120,12 +1151,13 @@ def search_jobs_monster():
 
 def search_jobs_careerbuilder():
     """
-    CareerBuilder — Playwright headless scraper.
-    Searches BA + ServiceNow in DC area, posted within 14 days.
+    CareerBuilder — Playwright headless scraper with stealth.
+    Searches BA + ServiceNow Business Analyst in DC area, posted within 14 days.
     No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1140,7 +1172,7 @@ def search_jobs_careerbuilder():
         ),
         (
             "https://www.careerbuilder.com/jobs"
-            "?keywords=servicenow+administrator"
+            "?keywords=servicenow+business+analyst"
             "&location=Maryland&radius=50&posted=14",
             "Maryland"
         ),
@@ -1155,20 +1187,15 @@ def search_jobs_careerbuilder():
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx     = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        browser, ctx = _pw_stealth_ctx(pw)
         for url, loc_label in searches:
             page = ctx.new_page()
             try:
+                _pw_apply_stealth(page)
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
                 _pw_dismiss_cookies(page)
+                _pw_human_mouse(page)
 
                 cards = page.query_selector_all(
                     "[class*='data-results-content'], "
@@ -1191,8 +1218,7 @@ def search_jobs_careerbuilder():
                         "[data-testid='location']"
                     )
                     sal_el   = card.query_selector(
-                        "[class*='salary'], [data-testid='salary'], "
-                        ".job-pay"
+                        "[class*='salary'], [data-testid='salary'], .job-pay"
                     )
                     if not title_el:
                         continue
@@ -1231,164 +1257,138 @@ def search_jobs_careerbuilder():
 
 def search_jobs_workday():
     """
-    Workday career portals for major DC-area employers.
-    Scrapes Booz Allen Hamilton, Leidos, SAIC, and CACI for
-    Business Analyst and ServiceNow roles using Playwright headless.
+    Workday career portals for major DC-area employers (Booz Allen, Leidos, SAIC, CACI).
+    Uses correct Angular data-automation-id selectors:
+      - [data-automation-id='jobTitle']   for job title links
+      - [data-automation-id='location']   for location
+      - [data-automation-id='postedOn']   for posted date
+    Waits up to 5 seconds after page load for Angular to fully render.
+    Applies playwright-stealth to avoid bot detection.
     No API key required.
     """
     if not _ensure_playwright():
         return []
+    _ensure_stealth()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return []
 
-    # Each entry: (employer_label, base_url, search_keyword)
     portals = [
         (
             "Booz Allen",
             "https://boozallen.wd1.myworkdayjobs.com/candidate/jobBoard/External_Career_Site",
-            ["business analyst", "ServiceNow"],
+            ["business analyst", "ServiceNow Business Analyst"],
         ),
         (
             "Leidos",
             "https://leidos.wd5.myworkdayjobs.com/External",
-            ["business analyst", "ServiceNow"],
+            ["business analyst", "ServiceNow Business Analyst"],
         ),
         (
             "SAIC",
             "https://jobs.saic.com",
-            ["business analyst", "ServiceNow"],
+            ["business analyst", "ServiceNow Business Analyst"],
         ),
         (
             "CACI",
             "https://caci.wd1.myworkdayjobs.com/External",
-            ["business analyst", "ServiceNow"],
+            ["business analyst", "ServiceNow Business Analyst"],
         ),
     ]
     found    = []
     seen_fps = set()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-
         for employer, base_url, keywords in portals:
             for keyword in keywords:
-                ctx  = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
-                )
+                browser, ctx = _pw_stealth_ctx(pw)
                 page = ctx.new_page()
                 try:
+                    _pw_apply_stealth(page)
                     page.goto(base_url, timeout=35000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
+
+                    # 5-second wait for Angular to fully render
+                    page.wait_for_timeout(5000)
                     _pw_dismiss_cookies(page)
 
-                    # ── Search via Workday search box ─────────────────────────
+                    # ── Enter search keyword ──────────────────────────────────
                     search_box = page.query_selector(
                         "[data-automation-id='searchBox'], "
                         "input[placeholder*='Search'], "
                         "input[aria-label*='Search'], "
-                        "input[type='search'], "
-                        "#keyword-input, input[name='q']"
+                        "input[type='search']"
                     )
                     if search_box:
                         search_box.click()
                         search_box.fill(keyword)
                         page.keyboard.press("Enter")
-                        page.wait_for_timeout(3000)
-                    else:
-                        # Try appending keyword to URL for Workday portals
-                        sep = "&" if "?" in base_url else "?"
-                        kw_enc = urllib.parse.quote_plus(keyword)
-                        page.goto(
-                            f"{base_url}{sep}q={kw_enc}",
-                            timeout=30000,
-                            wait_until="domcontentloaded",
-                        )
-                        page.wait_for_timeout(3000)
+                        # Wait for Angular to re-render results
+                        page.wait_for_timeout(5000)
 
-                    # ── Extract job listings ──────────────────────────────────
-                    # Workday standard selectors
-                    cards = page.query_selector_all(
-                        "li[class*='css-'] a[data-automation-id='jobPostingTitle'], "
-                        "[data-automation-id='jobFoundDescription'], "
-                        "li.css-1q2dra3, ul[class*='jobList'] li, "
-                        "[class*='jobCard'], .job-item"
+                    # ── Wait for the correct Workday job title elements ───────
+                    try:
+                        page.wait_for_selector(
+                            "[data-automation-id='jobTitle']",
+                            timeout=5000,
+                            state="attached",
+                        )
+                    except Exception:
+                        pass  # may still have results even without explicit wait
+
+                    # ── Extract using authoritative data-automation-id attrs ──
+                    title_links = page.query_selector_all(
+                        "[data-automation-id='jobTitle']"
                     )
+                    for link in title_links:
+                        try:
+                            title = (link.inner_text() or "").strip()
+                            href  = link.get_attribute("href") or ""
+                        except Exception:
+                            continue
+                        if not title:
+                            continue
 
-                    # Workday often renders titles as direct links; grab them all
-                    if not cards:
-                        cards = page.query_selector_all(
-                            "a[data-automation-id='jobPostingTitle']"
-                        )
-                        for link in cards:
-                            title    = (link.inner_text() or "").strip()
-                            href     = link.get_attribute("href") or ""
-                            full_url = href if href.startswith("http") else f"{base_url}{href}"
-                            if not title:
-                                continue
-                            fp = hashlib.md5(f"{title}|{employer}|{full_url}".encode()).hexdigest()
-                            if fp in seen_fps:
-                                continue
-                            seen_fps.add(fp)
-                            found.append(_make_job(
-                                title       = title,
-                                company     = employer,
-                                location    = "MD / DC / VA",
-                                url         = full_url,
-                                description = keyword,
-                                posted      = "",
-                                source      = f"Workday ({employer})",
-                            ))
-                    else:
-                        for card in cards:
-                            title_el = card.query_selector(
-                                "a[data-automation-id='jobPostingTitle'], "
-                                "h3 a, h2 a, a[class*='jobTitle'], a"
+                        # Try to get location from sibling/parent elements
+                        loc = ""
+                        try:
+                            container = link.evaluate_handle(
+                                "el => el.closest('li') || el.parentElement"
                             )
-                            loc_el   = card.query_selector(
-                                "dd[data-automation-id='locations'], "
-                                "[class*='location'], [data-automation-id='jobPostingLocation']"
-                            )
-                            date_el  = card.query_selector(
-                                "dd[data-automation-id='postedOn'], "
-                                "[class*='date'], time"
-                            )
-                            if not title_el:
-                                continue
-                            title    = (title_el.inner_text() or "").strip()
-                            href     = title_el.get_attribute("href") or ""
-                            loc      = (loc_el.inner_text()   or "").strip() if loc_el   else "MD / DC / VA"
-                            posted   = (date_el.inner_text()  or "").strip() if date_el  else ""
-                            full_url = href if href.startswith("http") else f"{base_url}{href}"
-                            if not title:
-                                continue
-                            fp = hashlib.md5(f"{title}|{employer}|{full_url}".encode()).hexdigest()
-                            if fp in seen_fps:
-                                continue
-                            seen_fps.add(fp)
-                            found.append(_make_job(
-                                title       = title,
-                                company     = employer,
-                                location    = loc,
-                                url         = full_url,
-                                description = keyword,
-                                posted      = posted,
-                                source      = f"Workday ({employer})",
-                            ))
+                            if container:
+                                loc_el = container.query_selector(
+                                    "[data-automation-id='location'], "
+                                    "[data-automation-id='locations'], "
+                                    "[data-automation-id='jobPostingLocation']"
+                                )
+                                if loc_el:
+                                    loc = (loc_el.inner_text() or "").strip()
+                        except Exception:
+                            pass
+
+                        full_url = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
+                        fp = hashlib.md5(f"{title}|{employer}|{full_url}".encode()).hexdigest()
+                        if fp in seen_fps:
+                            continue
+                        seen_fps.add(fp)
+                        found.append(_make_job(
+                            title       = title,
+                            company     = employer,
+                            location    = loc or "MD / DC / VA",
+                            url         = full_url,
+                            description = keyword,
+                            posted      = "",
+                            source      = f"Workday ({employer})",
+                        ))
 
                 except Exception as e:
                     print(f"  Workday ({employer}/{keyword}): {e}")
                 finally:
                     page.close()
                     ctx.close()
+                    browser.close()
                 time.sleep(2)
 
-        browser.close()
     return found
 
 
@@ -1457,23 +1457,6 @@ def search_jobs_serpapi():
         except Exception as e:
             print(f"  SerpAPI error ({query}): {e}")
     return found
-
-
-def open_clearancejobs_browser():
-    """
-    ClearanceJobs browser fallback — opens two pre-filtered searches in the
-    default browser.  No public API is available; manual-review helper only.
-    """
-    searches = [
-        "https://clearancejobs.com/jobs/search?query=business+analyst&location=maryland",
-        "https://clearancejobs.com/jobs/search?query=servicenow&location=virginia",
-    ]
-    print("\n  [ClearanceJobs] Opening 2 pre-filtered searches in your browser...")
-    for url in searches:
-        print(f"  URL: {url}")
-        open_in_browser(url)
-        time.sleep(1)
-    print("  Review listings manually and use option [2] to log any you apply to.")
 
 
 # ─── FILTERING & SORTING ────────────────────────────────────────────────────
@@ -1568,77 +1551,6 @@ def save_cover_letter(profile, job, text=None):
     with open(filepath, "w") as f:
         f.write(content)
     return filepath
-
-
-def _claude_analyze_job(job, profile):
-    """
-    Call Claude API to score the job and explain the match.
-
-    Sends only title, company, location, and a trimmed description (max 200 words)
-    to minimise token usage.  Uses claude-haiku-4-5-20251001 (cheapest model).
-
-    Returns dict: {match_score, bullet_points}
-    Falls back to {match_score: 0, bullet_points: []} if API key is absent or call fails.
-    Set env: ANTHROPIC_API_KEY
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return {"match_score": 0, "bullet_points": []}
-
-    try:
-        import anthropic
-    except ImportError:
-        import subprocess, sys
-        print("  Auto-installing anthropic package...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet", "anthropic"]
-            )
-            import anthropic
-        except Exception as e:
-            print(f"  anthropic install failed: {e}")
-            return {"match_score": 0, "bullet_points": []}
-
-    prefs  = profile.get("job_preferences", {})
-    skills = profile.get("skills", [])
-
-    # Trim description to 200 words to keep prompt small
-    raw_desc = (job.get("description") or "").split()
-    desc     = " ".join(raw_desc[:200]) + ("…" if len(raw_desc) > 200 else "")
-
-    prompt = f"""Score how well this job matches the candidate's profile.
-
-JOB:
-Title: {job['title']}
-Company: {job['company']}
-Location: {job['location']}
-Description: {desc or '(no description available)'}
-
-CANDIDATE:
-Target roles: {', '.join(prefs.get('target_roles', []))}
-Key skills: {', '.join(skills[:15]) if skills else '(see profile)'}
-
-Respond with ONLY valid JSON (no markdown fences), exactly these keys:
-{{
-  "match_score": <integer 1-10>,
-  "bullet_points": ["<reason 1>", "<reason 2>", "<reason 3>"]
-}}
-bullet_points should be 2-3 concise bullets explaining why this job matches or doesn't match."""
-
-    try:
-        client  = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model      = "claude-haiku-4-5-20251001",
-            max_tokens = 300,
-            messages   = [{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"```[a-z]*\n?", "", raw).strip().rstrip("`").strip()
-        return json.loads(raw)
-    except Exception as e:
-        print(f"  Claude API error: {e}")
-        return {"match_score": 0, "bullet_points": []}
 
 
 # ─── BROWSER & APPLY ────────────────────────────────────────────────────────
@@ -1779,6 +1691,91 @@ def _pw_el_text(el, *selectors):
         except Exception:
             pass
     return ""
+
+
+def _ensure_stealth():
+    """
+    Auto-install playwright-stealth if not already available.
+    Returns True if the package is usable, False otherwise.
+    """
+    import subprocess, sys
+    try:
+        import playwright_stealth  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "playwright-stealth"]
+            )
+            return True
+        except Exception:
+            return False
+
+
+def _pw_apply_stealth(page):
+    """
+    Apply playwright-stealth patches to a page before navigation.
+    Removes navigator.webdriver, spoofs plugins/languages, etc.
+    Silent no-op if the package is unavailable.
+    """
+    try:
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
+    except Exception:
+        pass
+
+
+def _pw_stealth_ctx(pw, viewport_width=None):
+    """
+    Launch headless Chromium with a realistic stealth context:
+    - Mac Chrome user-agent string
+    - Random viewport 1200-1920 px wide (human range)
+    - en-US Accept-Language + sensible Accept headers
+    - America/New_York timezone
+    Returns (browser, context).  Caller must close both.
+    """
+    import random
+    width   = viewport_width or random.randint(1200, 1920)
+    height  = random.randint(800, 1080)
+    browser = pw.chromium.launch(headless=True)
+    ctx     = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        viewport         = {"width": width, "height": height},
+        locale           = "en-US",
+        timezone_id      = "America/New_York",
+        extra_http_headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept":          (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            "DNT": "1",
+        },
+    )
+    return browser, ctx
+
+
+def _pw_human_mouse(page):
+    """
+    Simulate brief human-like random mouse movements to defeat simple bot checks.
+    Uses the page viewport to keep movements inside the window.
+    """
+    import random
+    try:
+        vp = page.viewport_size or {"width": 1280, "height": 800}
+        w, h = vp["width"], vp["height"]
+        for _ in range(random.randint(3, 5)):
+            page.mouse.move(
+                random.randint(80, w - 80),
+                random.randint(80, h - 80),
+            )
+            page.wait_for_timeout(random.randint(60, 180))
+    except Exception:
+        pass
 
 
 def playwright_autofill_apply(job, profile, cover_letter_text=""):
@@ -2202,25 +2199,17 @@ def _job_category(job):
     return "Other"
 
 
-def display_jobs(jobs, max_show=None, profile=None):
+def display_jobs(jobs, max_show=None, profile=None, resume_words=None):
+    """
+    Print jobs grouped by category (ServiceNow / Business Analyst / Other).
+    If resume_words is provided (set of lowercase words from the user's resume PDF),
+    an ATS keyword match line is shown under each job.
+    """
     if not jobs:
         print("\nNo matching jobs found.")
         return
     limit     = max_show or len(jobs)
     displayed = jobs[:limit]
-
-    # Score ★+ jobs via Claude (only if API key present and profile provided)
-    use_claude = profile and bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if use_claude:
-        to_score = [j for j in displayed
-                    if j.get("_score", 0) >= 1 and "_claude_score" not in j]
-        if to_score:
-            print(f"\n  Scoring {len(to_score)} starred job(s) with Claude...", flush=True)
-        for j in to_score:
-            result = _claude_analyze_job(j, profile)
-            j["_claude_score"]  = result.get("match_score", 0)
-            bullets             = result.get("bullet_points", [])
-            j["_claude_reason"] = bullets[0].strip() if bullets else ""
 
     # Group jobs by category
     groups = {"ServiceNow": [], "Business Analyst": [], "Other": []}
@@ -2249,11 +2238,10 @@ def display_jobs(jobs, max_show=None, profile=None):
             print(f"    URL      : {job['url']}")
             if job.get("tags"):
                 print(f"    Tags     : {job['tags']}")
-            cs = job.get("_claude_score", 0)
-            cr = job.get("_claude_reason", "")
-            if cs:
-                reason_str = f" — {cr}" if cr else ""
-                print(f"    Match Score : {cs}/10{reason_str}")
+            if resume_words:
+                pct, missing = _ats_check(job, resume_words)
+                miss_str = ", ".join(missing[:5]) if missing else "none"
+                print(f"    ATS Match   : {pct}% — Missing keywords: {miss_str}")
             counter += 1
 
     if max_show and len(jobs) > max_show:
@@ -2265,7 +2253,6 @@ def display_jobs(jobs, max_show=None, profile=None):
 def interactive_apply(jobs, profile):
     tracker       = ApplicationTracker(TRACKER_DB)
     applied_count = 0
-    use_claude    = bool(os.environ.get("ANTHROPIC_API_KEY"))
 
     for i, job in enumerate(jobs, 1):
         print(f"\n{'='*65}")
@@ -2284,21 +2271,7 @@ def interactive_apply(jobs, profile):
             print("  Skipped.")
             continue
 
-        # ── Claude analysis (runs once per job, for 'a' or 'v') ──────────────
-        if action in ("a", "v"):
-            if use_claude:
-                print("  Analyzing with Claude...")
-            analysis    = _claude_analyze_job(job, profile)
-            match_score = analysis.get("match_score", 0)
-            bullet_pts  = analysis.get("bullet_points", [])
-            cover_text  = generate_cover_letter(profile, job)
-
-            if match_score:
-                print(f"  Match score : {match_score}/10")
-            if bullet_pts:
-                print("  Why it matches:")
-                for pt in bullet_pts:
-                    print(f"    • {pt}")
+        cover_text = generate_cover_letter(profile, job)
 
         if action == "v":
             print("\n--- Cover Letter Preview ---")
@@ -2316,15 +2289,15 @@ def interactive_apply(jobs, profile):
 
             submitted = input("\n  Did you submit this application? [y/n]: ").strip().lower()
             if submitted == "y":
-                notes       = input("  Notes (press Enter to skip): ").strip()
-                follow_up   = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+                notes     = input("  Notes (press Enter to skip): ").strip()
+                follow_up = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
                 tracker.log_application(
                     job,
-                    match_score    = match_score,
                     cover_letter   = cover_text,
                     follow_up_date = follow_up,
                     notes          = notes,
                 )
+                update_excel_applied(job["url"])
                 applied_count += 1
                 print(f"  Logged → {job['title']} @ {job['company']}")
                 print(f"  Follow-up reminder: {follow_up}")
@@ -2400,6 +2373,7 @@ def run_daily_digest(profile):
 
     print(f"\n  Digest saved to : {digest_file}")
     print(f"  Full JSON saved : {FOUND_JOBS_FILE}")
+    export_to_excel(new_jobs)
     display_jobs(new_jobs, profile=profile)
     return new_jobs
 
@@ -2469,6 +2443,422 @@ class ApplicationTracker:
             return set()
 
 
+# ─── EXCEL EXPORT ────────────────────────────────────────────────────────────
+
+_EXCEL_HEADERS = [
+    "Job Title", "Company", "Location", "Salary",
+    "Source", "Date Posted", "URL", "Applied",
+]
+_HEADER_FILL   = None  # set lazily after openpyxl import
+_GREEN_FILL    = None
+
+
+def _ensure_openpyxl():
+    try:
+        import openpyxl  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "openpyxl"]
+            )
+            return True
+        except Exception:
+            return False
+
+
+def _open_file(path):
+    """Open a file with the OS default application (cross-platform)."""
+    try:
+        if platform.system() == "Darwin":
+            subprocess.Popen(["open", path])
+        elif platform.system() == "Windows":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        print(f"  Could not open file automatically: {e}")
+
+
+def export_to_excel(jobs, filepath=None):
+    """
+    Write jobs list to an Excel file with formatted headers.
+    Columns: Job Title, Company, Location, Salary, Source, Date Posted, URL, Applied.
+    - Header row: bold, blue background, white text, auto-filter.
+    - Freezes the header row.
+    - Auto-fits column widths.
+    - Applied column is blank by default; green background when filled.
+    - Opens the file automatically after writing.
+    Returns the filepath used.
+    """
+    if not _ensure_openpyxl():
+        print("  openpyxl unavailable — skipping Excel export.")
+        return None
+
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    fp = filepath or EXCEL_FILE
+
+    # Load existing or create new workbook
+    if os.path.exists(fp):
+        wb = openpyxl.load_workbook(fp)
+        ws = wb.active
+        # Remap existing URLs so we can preserve Applied dates
+        existing_applied = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and len(row) >= 8 and row[6]:
+                existing_applied[row[6]] = row[7]  # url → applied date
+        wb.remove(ws)
+        ws = wb.create_sheet("Jobs", 0)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Jobs"
+        existing_applied = {}
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    green_fill  = PatternFill("solid", fgColor="C6EFCE")
+    bold_white  = Font(bold=True, color="FFFFFF")
+    bold_black  = Font(bold=True)
+    center      = Alignment(horizontal="center", vertical="center")
+
+    # Write headers
+    ws.append(_EXCEL_HEADERS)
+    for col_idx, cell in enumerate(ws[1], 1):
+        cell.font      = bold_white
+        cell.fill      = header_fill
+        cell.alignment = center
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Write data rows
+    for job in jobs:
+        url     = job.get("url", "")
+        applied = existing_applied.get(url, "")
+        ws.append([
+            job.get("title",   ""),
+            job.get("company", ""),
+            job.get("location",""),
+            job.get("salary",  ""),
+            job.get("source",  ""),
+            job.get("posted",  ""),
+            url,
+            applied,
+        ])
+        if applied:
+            for cell in ws[ws.max_row]:
+                cell.fill = green_fill
+
+    # Auto-fit column widths
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
+
+    wb.save(fp)
+    print(f"  Excel exported → {fp}")
+    _open_file(fp)
+    return fp
+
+
+def update_excel_applied(url, date_str=None, filepath=None):
+    """
+    Find the row in the Excel file matching `url` and set its Applied column
+    to today's date (or `date_str`).  Colors that row green.
+    Silent no-op if the file doesn't exist or URL isn't found.
+    """
+    if not _ensure_openpyxl():
+        return
+    import openpyxl
+    from openpyxl.styles import PatternFill
+
+    fp      = filepath or EXCEL_FILE
+    applied = date_str or date.today().isoformat()
+    green   = PatternFill("solid", fgColor="C6EFCE")
+
+    if not os.path.exists(fp):
+        return
+    try:
+        wb = openpyxl.load_workbook(fp)
+        ws = wb.active
+        url_col     = _EXCEL_HEADERS.index("URL") + 1      # 1-based
+        applied_col = _EXCEL_HEADERS.index("Applied") + 1
+        for row in ws.iter_rows(min_row=2):
+            if row[url_col - 1].value == url:
+                row[applied_col - 1].value = applied
+                for cell in row:
+                    cell.fill = green
+                break
+        wb.save(fp)
+    except Exception as e:
+        print(f"  update_excel_applied error: {e}")
+
+
+# ─── AUTO-REFRESH (every 3 days) ─────────────────────────────────────────────
+
+def _load_export_log():
+    if os.path.exists(EXPORT_LOG_FILE):
+        try:
+            with open(EXPORT_LOG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_export_log(data):
+    with open(EXPORT_LOG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def check_auto_refresh():
+    """
+    Return True if 3+ days have passed since the last full export.
+    If so, clear seen_jobs.json (force-fresh) and record today in export_log.json.
+    """
+    log      = _load_export_log()
+    last_str = log.get("last_export", "")
+    today    = date.today()
+
+    if last_str:
+        try:
+            last_date = date.fromisoformat(last_str)
+            if (today - last_date).days < 3:
+                return False
+        except ValueError:
+            pass
+
+    # 3+ days elapsed — reset seen jobs and log today
+    print("\n  ⟳  Auto-refreshing job list — 3 days have passed since last full export.")
+    if os.path.exists(SEEN_JOBS_FILE):
+        os.remove(SEEN_JOBS_FILE)
+    log["last_export"] = today.isoformat()
+    _save_export_log(log)
+    return True
+
+
+# ─── NEW-JOB FILTERING ───────────────────────────────────────────────────────
+
+def filter_new_jobs(jobs):
+    """
+    Compare jobs against seen_jobs.json (URL-based).
+    Returns (new_jobs, total_count).
+    Adds new job URLs to seen_jobs.json immediately.
+    """
+    seen = load_seen_jobs()
+    new  = [j for j in jobs if j.get("url") and j["url"] not in seen]
+    for j in new:
+        seen.add(j["url"])
+    save_seen_jobs(seen)
+    return new, len(jobs)
+
+
+# ─── ATS KEYWORD CHECKER ─────────────────────────────────────────────────────
+
+_RESUME_WORDS_CACHE = None
+
+
+def _load_resume_text(profile):
+    """
+    Extract text from the user's resume PDF (resume_path in profile.json).
+    Returns a frozenset of lowercase words, or empty frozenset on failure.
+    Auto-installs PyPDF2 if missing.
+    """
+    global _RESUME_WORDS_CACHE
+    if _RESUME_WORDS_CACHE is not None:
+        return _RESUME_WORDS_CACHE
+
+    resume_path = profile.get("personal", {}).get("resume_path", "")
+    if not resume_path or not os.path.exists(resume_path):
+        _RESUME_WORDS_CACHE = frozenset()
+        return _RESUME_WORDS_CACHE
+
+    try:
+        import PyPDF2
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "PyPDF2"]
+            )
+            import PyPDF2
+        except Exception:
+            _RESUME_WORDS_CACHE = frozenset()
+            return _RESUME_WORDS_CACHE
+
+    try:
+        text = ""
+        with open(resume_path, "rb") as fh:
+            reader = PyPDF2.PdfReader(fh)
+            for page in reader.pages:
+                text += (page.extract_text() or "") + " "
+        _RESUME_WORDS_CACHE = frozenset(re.findall(r"[a-z]{3,}", text.lower()))
+    except Exception:
+        _RESUME_WORDS_CACHE = frozenset()
+    return _RESUME_WORDS_CACHE
+
+
+# Target keywords checked for ATS match (lowercase)
+_ATS_KEYWORDS = [
+    "servicenow", "itsm", "agile", "sql", "jira", "itil",
+    "business analyst", "requirements", "stakeholder", "scrum",
+    "flow designer", "javascript", "api", "integration",
+    "salesforce", "project management", "change management",
+    "incident management", "service catalog", "process improvement",
+]
+
+
+def _ats_check(job, resume_words):
+    """
+    Compare job title + description against resume_words (frozenset of words).
+    Returns (match_pct: int, missing: list[str]).
+    Uses Python string matching only — no API calls.
+    """
+    job_text  = f"{job.get('title','')} {job.get('description','')}".lower()
+    present   = [kw for kw in _ATS_KEYWORDS if kw in job_text and kw in resume_words]
+    missing   = [kw for kw in _ATS_KEYWORDS if kw in job_text and kw not in resume_words]
+    total     = len([kw for kw in _ATS_KEYWORDS if kw in job_text]) or 1
+    pct       = round(len(present) / total * 100)
+    return pct, missing
+
+
+# ─── LINKEDIN EASY APPLY BATCH MODE ──────────────────────────────────────────
+
+def batch_linkedin_apply(profile):
+    """
+    Option [5] — Batch apply to all LinkedIn Easy Apply jobs in found_jobs.json.
+    For each LinkedIn job:
+      - Opens the job page with Playwright using the user's Chrome profile.
+      - Detects Easy Apply button (aria-label contains 'Easy Apply').
+      - Clicks Easy Apply, auto-fills name/email/phone from profile.
+      - Highlights the Submit/Next button and waits for Enter keypress.
+      - Logs to SQLite + updates Applied column in Excel if submitted.
+      - Moves to the next job automatically without prompting.
+    """
+    if not os.path.exists(FOUND_JOBS_FILE):
+        print("  No saved jobs found. Run a search first.")
+        return
+
+    with open(FOUND_JOBS_FILE) as f:
+        all_jobs = json.load(f)
+
+    linkedin_jobs = [j for j in all_jobs if "linkedin.com" in j.get("url", "")]
+    if not linkedin_jobs:
+        print("  No LinkedIn jobs in found_jobs.json.")
+        return
+
+    print(f"\n  Found {len(linkedin_jobs)} LinkedIn job(s). Starting batch Easy Apply...")
+    if not _ensure_playwright():
+        return
+    _ensure_stealth()
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return
+
+    personal  = profile.get("personal", {})
+    full_name = personal.get("name", "")
+    email     = personal.get("email", "")
+    phone     = personal.get("phone", "")
+    tracker   = ApplicationTracker(TRACKER_DB)
+    applied   = 0
+
+    chrome_profile = _find_chrome_profile()
+
+    with sync_playwright() as pw:
+        if chrome_profile and os.path.isdir(chrome_profile):
+            browser = pw.chromium.launch_persistent_context(
+                chrome_profile,
+                headless        = False,
+                channel         = "chrome",
+                args            = ["--start-maximized"],
+                ignore_default_args = ["--enable-automation"],
+            )
+            ctx  = None
+            page = browser.new_page()
+        else:
+            browser, ctx = _pw_stealth_ctx(pw)
+            page = ctx.new_page()
+            _pw_apply_stealth(page)
+
+        for i, job in enumerate(linkedin_jobs, 1):
+            url = job["url"]
+            print(f"\n  [{i}/{len(linkedin_jobs)}] {job['title']} @ {job['company']}")
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
+
+                # Look for Easy Apply button
+                easy_btn = page.query_selector(
+                    "button[aria-label*='Easy Apply'], "
+                    "button.jobs-apply-button[aria-label*='Easy Apply']"
+                )
+                if not easy_btn:
+                    print(f"    No Easy Apply button — skipping.")
+                    continue
+
+                easy_btn.click()
+                page.wait_for_timeout(1500)
+
+                # Auto-fill name / email / phone
+                for sel, val in [
+                    ("input[id*='name'], input[name*='name']",   full_name),
+                    ("input[type='email']",                      email),
+                    ("input[type='tel'], input[name*='phone']",  phone),
+                ]:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and val:
+                            el.fill(val)
+                    except Exception:
+                        pass
+
+                # Highlight Submit / Next button
+                submit_btn = page.query_selector(
+                    "button[aria-label*='Submit'], button[aria-label*='submit'], "
+                    "button[aria-label*='Next'], footer button[data-easy-apply-next-button]"
+                )
+                if submit_btn:
+                    page.evaluate(
+                        "el => el.style.cssText = 'outline: 4px solid red !important; "
+                        "background: yellow !important;'",
+                        submit_btn,
+                    )
+
+                print(f"    Press ENTER to submit, or type 's' + ENTER to skip: ", end="", flush=True)
+                user_input = input().strip().lower()
+                if user_input == "s":
+                    print("    Skipped.")
+                    continue
+
+                if submit_btn:
+                    submit_btn.click()
+                    page.wait_for_timeout(1500)
+
+                tracker.log_application(job)
+                update_excel_applied(url)
+                applied += 1
+                print(f"    Logged ✓")
+
+            except Exception as e:
+                print(f"    Error: {e}")
+
+        page.close()
+        if ctx:
+            ctx.close()
+        browser.close()
+
+    print(f"\n  Batch complete. Submitted {applied} application(s).")
+
+
 # ─── SEARCH RUNNER ──────────────────────────────────────────────────────────
 
 def _run_all_searches(profile, keywords):
@@ -2524,53 +2914,81 @@ def main():
         prefs.get("keywords", []) + prefs.get("target_roles", [])
     ))
 
+    # Load resume text once for ATS matching (silent if resume not set)
+    resume_words = _load_resume_text(profile)
+
+    # Check for auto-refresh (clears seen_jobs.json if 3+ days elapsed)
+    auto_refreshed = check_auto_refresh()
+
     print("\n  What would you like to do?")
-    print("  [1] Search all sources (view results only)")
+    print("  [1] Search all sources (view new jobs only)")
     print("  [2] Search all sources + apply interactively")
-    print("  [3] Run daily digest (new jobs only, saves jobs_YYYY-MM-DD.txt)")
-    print("  [4] View / apply to saved jobs from last search or digest")
+    print("  [3] Run daily digest (new jobs only, saves dated .txt)")
+    print("  [4] View / apply to saved jobs from last search")
+    print("  [5] Batch LinkedIn Easy Apply (all queued LinkedIn jobs)")
     choice = input("\n  Choice: ").strip()
+
+    if choice == "5":
+        batch_linkedin_apply(profile)
+        return
 
     if choice == "4":
         if os.path.exists(FOUND_JOBS_FILE):
             with open(FOUND_JOBS_FILE) as f:
                 jobs = json.load(f)
-            display_jobs(jobs, profile=profile)
+            display_jobs(jobs, profile=profile, resume_words=resume_words or None)
             go = input("\n  [a] Apply interactively  [q] Quit: ").strip().lower()
             if go == "a":
                 interactive_apply(jobs, profile)
         else:
             print("  No saved jobs found. Run a search first (options 1, 2, or 3).")
+        return
 
-    elif choice == "3":
+    if choice == "3":
         new_jobs = run_daily_digest(profile)
         if new_jobs:
             go = input("\n  Apply to new jobs interactively? [y/n]: ").strip().lower()
             if go == "y":
                 interactive_apply(new_jobs, profile)
+        return
 
-    elif choice in ("1", "2"):
+    if choice in ("1", "2"):
         print(f"\n  Searching {len(keywords)} keyword(s) across all sources...\n")
         all_jobs = _run_all_searches(profile, keywords)
         filtered = filter_jobs(all_jobs, profile)
-        print(f"\n  Filtered to {len(filtered)} unique, relevant jobs.")
 
+        # ── New-job filtering ─────────────────────────────────────────────────
+        new_jobs, total = filter_new_jobs(filtered)
+        print(f"\n  Found {total} total jobs — {len(new_jobs)} are new since last run.")
+
+        if not new_jobs:
+            print("  No new jobs since last run.  Use [4] to review saved jobs.")
+            return
+
+        # Save new jobs to found_jobs.json for option [4] / batch apply
         with open(FOUND_JOBS_FILE, "w") as f:
-            json.dump(filtered, f, indent=2)
-        print(f"  Saved to {FOUND_JOBS_FILE}")
+            json.dump(new_jobs, f, indent=2)
 
-        display_jobs(filtered, profile=profile)
+        # ── Excel export ──────────────────────────────────────────────────────
+        if auto_refreshed:
+            # Dated file exported to ~/Documents on 3-day refresh
+            dated_name = f"jobs_export_{date.today().isoformat()}.xlsx"
+            docs_dir   = os.path.expanduser("~/Documents")
+            dated_path = os.path.join(docs_dir, dated_name)
+            export_to_excel(new_jobs, filepath=dated_path)
+        export_to_excel(new_jobs)   # always write/refresh jobs_export.xlsx locally
 
-        # ClearanceJobs has no public API — open a pre-filtered browser search
-        open_clearancejobs_browser()
+        # ── Display ───────────────────────────────────────────────────────────
+        display_jobs(new_jobs, profile=profile,
+                     resume_words=resume_words or None)
 
-        if choice == "2" and filtered:
+        if choice == "2" and new_jobs:
             go = input("\n  Start applying interactively? [y/n]: ").strip().lower()
             if go == "y":
-                interactive_apply(filtered, profile)
+                interactive_apply(new_jobs, profile)
+        return
 
-    else:
-        print("  Invalid choice. Please run the script again.")
+    print("  Invalid choice. Please run the script again.")
 
 
 if __name__ == "__main__":
