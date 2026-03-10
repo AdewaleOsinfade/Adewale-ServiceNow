@@ -803,457 +803,114 @@ def search_jobs_dice():
 
 # ─── PLAYWRIGHT JOB BOARD SCRAPERS ──────────────────────────────────────────
 
-def search_jobs_glassdoor():
-    """
-    Glassdoor — Playwright headless scraper with stealth.
-    Runs 5 targeted searches so results aren't limited to ~5 listings:
-      1. 'business analyst servicenow' — DC metro (locId=9)
-      2. 'business analyst servicenow DC' — DC metro
-      3. 'business analyst' — Maryland (locId=48, state)
-      4. 'ITSM analyst' — Virginia (locId=46, state)
-      5. 'servicenow administrator' — DC metro
-    Deduplicates across all searches.  No API key required.
-    """
-    if not _ensure_playwright():
-        return []
-    _ensure_stealth()
+# ─── python-jobspy (Indeed + Glassdoor + ZipRecruiter) ───────────────────────
+
+def _ensure_jobspy():
+    """Auto-install python-jobspy if missing. Returns True if available."""
     try:
-        from playwright.sync_api import sync_playwright
+        import jobspy  # noqa: F401
+        return True
     except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "python-jobspy"]
+            )
+            return True
+        except Exception as e:
+            print(f"  python-jobspy install failed: {e}")
+            return False
+
+
+def search_jobs_jobspy():
+    """
+    Use python-jobspy (built-in anti-detection) to scrape Indeed, Glassdoor,
+    and ZipRecruiter simultaneously.
+    Runs three search terms × two locations = 6 passes, deduplicates by URL.
+    No API key, no Playwright, no bot blocks.
+    """
+    if not _ensure_jobspy():
         return []
 
-    # (url, display label for fallback location)
-    searches = [
-        (
-            "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=business+analyst+servicenow"
-            "&locT=M&locId=9&radius=50",
-            "DC Metro"
-        ),
-        (
-            "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=business+analyst+servicenow+DC"
-            "&locT=M&locId=9&radius=50",
-            "DC Metro"
-        ),
-        (
-            "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=business+analyst"
-            "&locT=S&locId=48&radius=50",
-            "Maryland"
-        ),
-        (
-            "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=ITSM+analyst"
-            "&locT=S&locId=46&radius=50",
-            "Virginia"
-        ),
-        (
-            "https://www.glassdoor.com/Job/jobs.htm"
-            "?sc.keyword=servicenow+business+analyst"
-            "&locT=M&locId=9&radius=50",
-            "DC Metro"
-        ),
-    ]
-    found    = []
-    seen_fps = set()
-
-    with sync_playwright() as pw:
-        browser, ctx = _pw_stealth_ctx(pw)
-        for url, loc_label in searches:
-            page = ctx.new_page()
-            try:
-                _pw_apply_stealth(page)
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                _pw_dismiss_cookies(page)
-                _pw_human_mouse(page)
-
-                # Try to wait for job listings to appear
-                try:
-                    page.wait_for_selector(
-                        "li[data-test='jobListing'], [class*='JobCard']",
-                        timeout=5000,
-                        state="attached",
-                    )
-                except Exception:
-                    pass
-
-                cards = page.query_selector_all(
-                    "li[data-test='jobListing'], "
-                    "[class*='JobCard_jobCardContainer'], "
-                    "article[class*='JobCard'], "
-                    "[class*='job-search-key']"
-                )
-                for card in cards:
-                    title_el = card.query_selector(
-                        "[data-test='job-title'], "
-                        "a[class*='JobCard_seoLink'], "
-                        "a[class*='jobTitle'], h3 a, h2 a"
-                    )
-                    comp_el  = card.query_selector(
-                        "[data-test='employerName'], "
-                        "[class*='EmployerProfile'], "
-                        "[class*='employerName']"
-                    )
-                    loc_el   = card.query_selector(
-                        "[data-test='location'], "
-                        "[class*='jobLocation'], "
-                        "[class*='JobCard_location']"
-                    )
-                    sal_el   = card.query_selector(
-                        "[data-test='detailSalary'], "
-                        "[class*='salary'], [class*='Salary']"
-                    )
-                    if not title_el:
-                        continue
-                    title  = (title_el.inner_text() or "").strip()
-                    href   = title_el.get_attribute("href") or ""
-                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
-                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
-                    salary = (sal_el.inner_text()   or "").strip() if sal_el   else ""
-                    if not title:
-                        continue
-                    full_url = href if href.startswith("http") else f"https://www.glassdoor.com{href}"
-                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
-                    if fp in seen_fps:
-                        continue
-                    seen_fps.add(fp)
-                    found.append(_make_job(
-                        title       = title,
-                        company     = comp   or "See listing",
-                        location    = loc,
-                        url         = full_url,
-                        description = "",
-                        posted      = "",
-                        source      = "Glassdoor",
-                        salary      = salary,
-                    ))
-
-            except Exception as e:
-                print(f"  Glassdoor error ({loc_label}): {e}")
-            finally:
-                page.close()
-            time.sleep(2)
-
-        browser.close()
-    return found
-
-
-def search_jobs_ziprecruiter():
-    """
-    ZipRecruiter — Playwright headless scraper with stealth + human-like headers.
-    Searches BA + ServiceNow Business Analyst near Washington DC / Maryland.
-    No API key required.
-    """
-    if not _ensure_playwright():
-        return []
-    _ensure_stealth()
     try:
-        from playwright.sync_api import sync_playwright
+        from jobspy import scrape_jobs
     except ImportError:
         return []
 
     searches = [
-        (
-            "https://www.ziprecruiter.com/jobs-search"
-            "?search=business+analyst+servicenow"
-            "&location=Washington+DC&radius=50",
-            "Washington DC"
-        ),
-        (
-            "https://www.ziprecruiter.com/jobs-search"
-            "?search=servicenow+business+analyst"
-            "&location=Maryland&radius=50",
-            "Maryland"
-        ),
-        (
-            "https://www.ziprecruiter.com/jobs-search"
-            "?search=business+analyst+ITSM"
-            "&location=Washington+DC&radius=50",
-            "Washington DC"
-        ),
+        ("Business Analyst ServiceNow", "Washington DC"),
+        ("ITSM Business Analyst",       "Washington DC"),
+        ("Business Analyst",            "Washington DC"),
+        ("Business Analyst ServiceNow", "Maryland"),
+        ("ITSM Business Analyst",       "Maryland"),
+        ("Business Analyst",            "Maryland"),
     ]
+
     found    = []
-    seen_fps = set()
+    seen_urls = set()
 
-    with sync_playwright() as pw:
-        browser, ctx = _pw_stealth_ctx(pw)
-        for url, loc_label in searches:
-            page = ctx.new_page()
-            try:
-                _pw_apply_stealth(page)
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                _pw_dismiss_cookies(page)
-                _pw_human_mouse(page)
+    for search_term, location in searches:
+        try:
+            df = scrape_jobs(
+                site_name     = ["indeed", "glassdoor", "zip_recruiter"],
+                search_term   = search_term,
+                location      = location,
+                results_wanted = 50,
+                hours_old     = 336,   # 14 days
+                country_indeed = "USA",
+            )
+        except Exception as e:
+            print(f"  jobspy error ({search_term} / {location}): {e}")
+            continue
 
-                cards = page.query_selector_all(
-                    "article[data-job-id], "
-                    "[class*='job_result'], "
-                    "[class*='jobCard'], "
-                    "div[class*='JobCard']"
-                )
-                for card in cards:
-                    title_el = card.query_selector(
-                        "h2[class*='title'], a[class*='job_title'], "
-                        "h2 a, h3 a, [class*='jobTitle'] a"
-                    )
-                    comp_el  = card.query_selector(
-                        "[class*='company'], [class*='employer'], "
-                        "a[data-testid='company-name']"
-                    )
-                    loc_el   = card.query_selector(
-                        "[class*='location'], [data-testid='location']"
-                    )
-                    if not title_el:
-                        continue
-                    title = (title_el.inner_text() or "").strip()
-                    href  = title_el.get_attribute("href") or ""
-                    if not href:
-                        try:
-                            anc  = title_el.evaluate("el => el.closest('a')?.href || ''")
-                            href = anc or ""
-                        except Exception:
-                            pass
-                    comp = (comp_el.inner_text() or "").strip() if comp_el else ""
-                    loc  = (loc_el.inner_text()  or "").strip() if loc_el  else loc_label
-                    if not title:
-                        continue
-                    full_url = href if href.startswith("http") else f"https://www.ziprecruiter.com{href}"
-                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
-                    if fp in seen_fps:
-                        continue
-                    seen_fps.add(fp)
-                    found.append(_make_job(
-                        title       = title,
-                        company     = comp   or "See listing",
-                        location    = loc,
-                        url         = full_url,
-                        description = "",
-                        posted      = "",
-                        source      = "ZipRecruiter",
-                    ))
+        if df is None or df.empty:
+            continue
 
-            except Exception as e:
-                print(f"  ZipRecruiter error ({loc_label}): {e}")
-            finally:
-                page.close()
-            time.sleep(2)
+        for _, row in df.iterrows():
+            url = str(row.get("job_url") or row.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
 
-        browser.close()
+            # Salary — combine min/max if present
+            s_min = row.get("min_amount", "")
+            s_max = row.get("max_amount", "")
+            interval = str(row.get("interval", "") or "")
+            if s_min and s_max:
+                salary = f"${float(s_min):,.0f} – ${float(s_max):,.0f}"
+                if interval:
+                    salary += f" /{interval}"
+            else:
+                salary = str(row.get("salary", "") or "").strip()
+
+            # Source label
+            site = str(row.get("site", "") or "").strip()
+            source_map = {
+                "indeed":       "Indeed",
+                "glassdoor":    "Glassdoor",
+                "zip_recruiter":"ZipRecruiter",
+            }
+            source = source_map.get(site.lower(), site.title() or "JobSpy")
+
+            # Posted date
+            posted = ""
+            raw_date = row.get("date_posted") or row.get("date") or ""
+            if raw_date and str(raw_date) not in ("NaT", "None", "nan"):
+                posted = str(raw_date)[:10]
+
+            found.append(_make_job(
+                title       = str(row.get("title",   "") or "").strip(),
+                company     = str(row.get("company", "") or "").strip() or "See listing",
+                location    = str(row.get("location","") or location).strip(),
+                url         = url,
+                description = str(row.get("description", "") or "")[:500],
+                posted      = posted,
+                source      = source,
+                salary      = salary,
+            ))
+
+        time.sleep(2)   # be polite between searches
+
     return found
-
-
-def search_jobs_monster():
-    """
-    Monster.com — Playwright headless scraper with stealth.
-    Searches BA + ServiceNow Business Analyst in DC area, posted within 14 days.
-    No API key required.
-    """
-    if not _ensure_playwright():
-        return []
-    _ensure_stealth()
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return []
-
-    searches = [
-        (
-            "https://www.monster.com/jobs/search"
-            "?q=business+analyst+servicenow"
-            "&where=Washington__2C-DC&radius=50&tm=14",
-            "Washington DC"
-        ),
-        (
-            "https://www.monster.com/jobs/search"
-            "?q=servicenow+business+analyst"
-            "&where=Maryland&radius=50&tm=14",
-            "Maryland"
-        ),
-        (
-            "https://www.monster.com/jobs/search"
-            "?q=business+analyst+ITSM"
-            "&where=Virginia&radius=50&tm=14",
-            "Virginia"
-        ),
-    ]
-    found    = []
-    seen_fps = set()
-
-    with sync_playwright() as pw:
-        browser, ctx = _pw_stealth_ctx(pw)
-        for url, loc_label in searches:
-            page = ctx.new_page()
-            try:
-                _pw_apply_stealth(page)
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                _pw_dismiss_cookies(page)
-                _pw_human_mouse(page)
-
-                cards = page.query_selector_all(
-                    "[data-testid='JobCard'], "
-                    ".flex-row[class*='JobResultWrapper'], "
-                    "section[class*='card-content'], "
-                    "[class*='job-search-card']"
-                )
-                for card in cards:
-                    title_el = card.query_selector(
-                        "h3 a, h2 a, [class*='title'] a, "
-                        "[data-testid='jobTitle'], a[class*='job-title']"
-                    )
-                    comp_el  = card.query_selector(
-                        "[class*='company'], [data-testid='company'], "
-                        "span[class*='name']"
-                    )
-                    loc_el   = card.query_selector(
-                        "[class*='location'], [data-testid='location'], "
-                        "span[class*='location']"
-                    )
-                    date_el  = card.query_selector(
-                        "[class*='date'], time, [data-testid='date']"
-                    )
-                    if not title_el:
-                        continue
-                    title  = (title_el.inner_text() or "").strip()
-                    href   = title_el.get_attribute("href") or ""
-                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
-                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
-                    posted = (date_el.inner_text()  or "").strip() if date_el  else ""
-                    if not title:
-                        continue
-                    full_url = href if href.startswith("http") else f"https://www.monster.com{href}"
-                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
-                    if fp in seen_fps:
-                        continue
-                    seen_fps.add(fp)
-                    found.append(_make_job(
-                        title       = title,
-                        company     = comp   or "See listing",
-                        location    = loc,
-                        url         = full_url,
-                        description = "",
-                        posted      = posted,
-                        source      = "Monster",
-                    ))
-
-            except Exception as e:
-                print(f"  Monster error ({loc_label}): {e}")
-            finally:
-                page.close()
-            time.sleep(2)
-
-        browser.close()
-    return found
-
-
-def search_jobs_careerbuilder():
-    """
-    CareerBuilder — Playwright headless scraper with stealth.
-    Searches BA + ServiceNow Business Analyst in DC area, posted within 14 days.
-    No API key required.
-    """
-    if not _ensure_playwright():
-        return []
-    _ensure_stealth()
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return []
-
-    searches = [
-        (
-            "https://www.careerbuilder.com/jobs"
-            "?keywords=business+analyst+servicenow"
-            "&location=Washington+DC&radius=50&posted=14",
-            "Washington DC"
-        ),
-        (
-            "https://www.careerbuilder.com/jobs"
-            "?keywords=servicenow+business+analyst"
-            "&location=Maryland&radius=50&posted=14",
-            "Maryland"
-        ),
-        (
-            "https://www.careerbuilder.com/jobs"
-            "?keywords=business+analyst+ITSM"
-            "&location=Virginia&radius=50&posted=14",
-            "Virginia"
-        ),
-    ]
-    found    = []
-    seen_fps = set()
-
-    with sync_playwright() as pw:
-        browser, ctx = _pw_stealth_ctx(pw)
-        for url, loc_label in searches:
-            page = ctx.new_page()
-            try:
-                _pw_apply_stealth(page)
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                _pw_dismiss_cookies(page)
-                _pw_human_mouse(page)
-
-                cards = page.query_selector_all(
-                    "[class*='data-results-content'], "
-                    "li[class*='job-listing'], "
-                    "[data-testid='job-card'], "
-                    ".col-full.head"
-                )
-                for card in cards:
-                    title_el = card.query_selector(
-                        "a[class*='show-for-medium'], "
-                        "a[data-testid='job-title'], "
-                        "h2 a, h3 a, .job-title a"
-                    )
-                    comp_el  = card.query_selector(
-                        "[class*='data-details'] span:first-child, "
-                        "[class*='company'], [data-testid='company']"
-                    )
-                    loc_el   = card.query_selector(
-                        "[class*='job-location'], [class*='location'], "
-                        "[data-testid='location']"
-                    )
-                    sal_el   = card.query_selector(
-                        "[class*='salary'], [data-testid='salary'], .job-pay"
-                    )
-                    if not title_el:
-                        continue
-                    title  = (title_el.inner_text() or "").strip()
-                    href   = title_el.get_attribute("href") or ""
-                    comp   = (comp_el.inner_text()  or "").strip() if comp_el  else ""
-                    loc    = (loc_el.inner_text()   or "").strip() if loc_el   else loc_label
-                    salary = (sal_el.inner_text()   or "").strip() if sal_el   else ""
-                    if not title:
-                        continue
-                    full_url = href if href.startswith("http") else f"https://www.careerbuilder.com{href}"
-                    fp = hashlib.md5(f"{title}|{comp}|{full_url}".encode()).hexdigest()
-                    if fp in seen_fps:
-                        continue
-                    seen_fps.add(fp)
-                    found.append(_make_job(
-                        title       = title,
-                        company     = comp   or "See listing",
-                        location    = loc,
-                        url         = full_url,
-                        description = "",
-                        posted      = "",
-                        source      = "CareerBuilder",
-                        salary      = salary,
-                    ))
-
-            except Exception as e:
-                print(f"  CareerBuilder error ({loc_label}): {e}")
-            finally:
-                page.close()
-            time.sleep(2)
-
-        browser.close()
-    return found
-
 
 def search_jobs_workday():
     """
@@ -2859,6 +2516,317 @@ def batch_linkedin_apply(profile):
     print(f"\n  Batch complete. Submitted {applied} application(s).")
 
 
+# ─── BUILT IN DC ─────────────────────────────────────────────────────────────
+
+def search_jobs_builtin():
+    """
+    Built In DC — simple requests scrape, no bot blocking.
+    Searches https://builtin.com/jobs/washington-dc for business analyst roles.
+    No API key required.
+    """
+    base      = "https://builtin.com"
+    searches  = [
+        f"{base}/jobs/washington-dc?search=business+analyst",
+        f"{base}/jobs/washington-dc?search=servicenow+business+analyst",
+        f"{base}/jobs/washington-dc?search=ITSM+analyst",
+        f"{base}/jobs/remote?search=servicenow+business+analyst",
+    ]
+    found     = []
+    seen_fps  = set()
+    headers   = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    class _Parser(HTMLParser):
+        """Lightweight parser to extract job cards from Built In HTML."""
+        def __init__(self):
+            super().__init__()
+            self.jobs        = []
+            self._in_card    = False
+            self._card_depth = 0
+            self._cur        = {}
+            self._capture    = None
+            self._buf        = []
+            self._tag_stack  = []
+
+        def _attr(self, attrs, name):
+            return dict(attrs).get(name, "")
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            cls = a.get("class", "")
+            self._tag_stack.append(tag)
+
+            # Card opens on <div> with 'job-card' in class or data-id
+            if tag == "div" and ("job-card" in cls or "JobCard" in cls):
+                self._in_card    = True
+                self._card_depth = len(self._tag_stack)
+                self._cur        = {}
+
+            if not self._in_card:
+                return
+
+            # Title link: <a> inside a heading with a recognisable class or href
+            if tag == "a" and "/jobs/" in a.get("href", "") and not self._cur.get("url"):
+                href = a.get("href", "")
+                self._cur["url"]  = href if href.startswith("http") else f"https://builtin.com{href}"
+                self._capture = "title"
+                self._buf     = []
+
+            # Company span
+            if tag in ("span", "div") and "company" in cls.lower() and not self._cur.get("company"):
+                self._capture = "company"
+                self._buf     = []
+
+            # Location span
+            if tag in ("span", "div") and "location" in cls.lower() and not self._cur.get("location"):
+                self._capture = "location"
+                self._buf     = []
+
+            # Salary span
+            if tag in ("span", "div") and "salary" in cls.lower() and not self._cur.get("salary"):
+                self._capture = "salary"
+                self._buf     = []
+
+        def handle_endtag(self, tag):
+            if self._tag_stack:
+                self._tag_stack.pop()
+            if self._in_card and len(self._tag_stack) < self._card_depth:
+                self._in_card = False
+                if self._cur.get("url") and self._cur.get("title"):
+                    self.jobs.append(dict(self._cur))
+                self._cur   = {}
+                self._capture = None
+            if tag == "a" and self._capture == "title":
+                self._cur["title"] = " ".join(self._buf).strip()
+                self._capture      = None
+
+        def handle_data(self, data):
+            if self._capture:
+                self._buf.append(data)
+
+    for url in searches:
+        try:
+            req  = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+
+            # Fast JSON-LD extraction first (built.in embeds structured data)
+            for block in re.findall(
+                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                html, re.S
+            ):
+                try:
+                    obj = json.loads(block)
+                    items = obj if isinstance(obj, list) else [obj]
+                    for item in items:
+                        if item.get("@type") not in ("JobPosting", "Job"):
+                            continue
+                        job_url = item.get("url", "")
+                        title   = item.get("title", "").strip()
+                        comp    = (item.get("hiringOrganization") or {}).get("name", "")
+                        loc_obj = item.get("jobLocation") or {}
+                        addr    = loc_obj.get("address") or {}
+                        loc     = (addr.get("addressLocality", "") + ", " +
+                                   addr.get("addressRegion", "")).strip(", ")
+                        sal_obj = item.get("baseSalary") or {}
+                        s_min   = sal_obj.get("value", {}).get("minValue", "")
+                        s_max   = sal_obj.get("value", {}).get("maxValue", "")
+                        salary  = (f"${float(s_min):,.0f} – ${float(s_max):,.0f}"
+                                   if s_min and s_max else "")
+                        posted  = item.get("datePosted", "")[:10]
+                        if not (title and job_url):
+                            continue
+                        fp = hashlib.md5(f"{title}|{comp}|{job_url}".encode()).hexdigest()
+                        if fp in seen_fps:
+                            continue
+                        seen_fps.add(fp)
+                        found.append(_make_job(
+                            title=title, company=comp or "See listing",
+                            location=loc or "Washington DC",
+                            url=job_url, description="", posted=posted,
+                            source="Built In DC", salary=salary,
+                        ))
+                except Exception:
+                    pass
+
+            # Fall back to HTML parser for anything JSON-LD missed
+            parser = _Parser()
+            parser.feed(html)
+            for j in parser.jobs:
+                title = j.get("title", "").strip()
+                jurl  = j.get("url", "").strip()
+                if not title or not jurl:
+                    continue
+                fp = hashlib.md5(f"{title}|{jurl}".encode()).hexdigest()
+                if fp in seen_fps:
+                    continue
+                seen_fps.add(fp)
+                found.append(_make_job(
+                    title=title,
+                    company=j.get("company", "See listing"),
+                    location=j.get("location", "Washington DC"),
+                    url=jurl, description="", posted="",
+                    source="Built In DC",
+                    salary=j.get("salary", ""),
+                ))
+
+        except Exception as e:
+            print(f"  Built In DC error ({url[-40:]}): {e}")
+        time.sleep(1)
+
+    return found
+
+
+# ─── GREENHOUSE PUBLIC API ───────────────────────────────────────────────────
+
+_GH_LOCATION_KEYWORDS = {
+    "dc", "washington", "maryland", "virginia", "va", "md",
+    "remote", "dmv", "bethesda", "rockville", "mclean", "arlington",
+    "reston", "tysons", "silver spring", "annapolis",
+}
+_GH_TITLE_KEYWORDS = {
+    "business analyst", "ba ", " ba,", "servicenow", "itsm",
+    "systems analyst", "process analyst", "it analyst",
+}
+
+
+def _gh_job_matches(title, location):
+    """Return True if the job title + location look relevant."""
+    t = title.lower()
+    l = location.lower()
+    title_ok    = any(kw in t for kw in _GH_TITLE_KEYWORDS)
+    location_ok = (
+        any(kw in l for kw in _GH_LOCATION_KEYWORDS) or not l.strip()
+    )
+    return title_ok and location_ok
+
+
+def search_jobs_greenhouse():
+    """
+    Greenhouse public job board API (no key required).
+    Checks Deloitte, Accenture, Booz Allen, and MITRE for Business Analyst
+    and ServiceNow roles in DC/MD/VA/Remote locations.
+    """
+    boards = [
+        ("Deloitte",   "deloitte"),
+        ("Accenture",  "accenture"),
+        ("Booz Allen", "boozallen"),
+        ("MITRE",      "mitre"),
+    ]
+    found    = []
+    seen_fps = set()
+
+    for company, board_token in boards:
+        url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
+        try:
+            data = json.loads(_fetch(url))
+        except Exception as e:
+            print(f"  Greenhouse ({company}): {e}")
+            continue
+
+        for job in data.get("jobs", []):
+            title    = (job.get("title") or "").strip()
+            job_url  = (job.get("absolute_url") or "").strip()
+            location = (job.get("location", {}).get("name") or "").strip()
+            if not title or not job_url:
+                continue
+            if not _gh_job_matches(title, location):
+                continue
+            fp = hashlib.md5(f"{title}|{company}|{job_url}".encode()).hexdigest()
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            found.append(_make_job(
+                title       = title,
+                company     = company,
+                location    = location or "DC / MD / VA",
+                url         = job_url,
+                description = "",
+                posted      = "",
+                source      = f"Greenhouse ({company})",
+            ))
+        time.sleep(1)
+
+    return found
+
+
+# ─── LEVER PUBLIC API ────────────────────────────────────────────────────────
+
+_LEVER_TITLE_KEYWORDS = _GH_TITLE_KEYWORDS
+_LEVER_LOCATION_KEYWORDS = _GH_LOCATION_KEYWORDS
+
+
+def _lever_job_matches(title, location, categories):
+    """Return True if posting looks relevant."""
+    t = title.lower()
+    l = (location or "").lower()
+    c = str(categories).lower()
+    title_ok    = any(kw in t for kw in _LEVER_TITLE_KEYWORDS)
+    location_ok = (
+        any(kw in l for kw in _LEVER_LOCATION_KEYWORDS)
+        or any(kw in c for kw in _LEVER_LOCATION_KEYWORDS)
+        or not l.strip()
+    )
+    return title_ok and location_ok
+
+
+def search_jobs_lever():
+    """
+    Lever public postings API (no key required).
+    Checks CGI and Guidehouse for Business Analyst roles in DC/MD/VA.
+    """
+    companies = [
+        ("CGI",         "https://api.lever.co/v0/postings/cgi?mode=json"),
+        ("Guidehouse",  "https://api.lever.co/v0/postings/guidehouse?mode=json"),
+    ]
+    found    = []
+    seen_fps = set()
+
+    for company, url in companies:
+        try:
+            data = json.loads(_fetch(url))
+        except Exception as e:
+            print(f"  Lever ({company}): {e}")
+            continue
+
+        if not isinstance(data, list):
+            continue
+
+        for job in data:
+            title    = (job.get("text") or "").strip()
+            job_url  = (job.get("hostedUrl") or job.get("applyUrl") or "").strip()
+            cats     = job.get("categories") or {}
+            location = (cats.get("location") or cats.get("allLocations") or "").strip()
+            team     = cats.get("team", "")
+            if not title or not job_url:
+                continue
+            if not _lever_job_matches(title, location, team):
+                continue
+            fp = hashlib.md5(f"{title}|{company}|{job_url}".encode()).hexdigest()
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            found.append(_make_job(
+                title       = title,
+                company     = company,
+                location    = location or "DC / MD / VA",
+                url         = job_url,
+                description = "",
+                posted      = "",
+                source      = f"Lever ({company})",
+            ))
+        time.sleep(1)
+
+    return found
+
+
 # ─── SEARCH RUNNER ──────────────────────────────────────────────────────────
 
 def _run_all_searches(profile, keywords):
@@ -2867,29 +2835,30 @@ def _run_all_searches(profile, keywords):
 
     # ── Standard API / RSS sources ───────────────────────────────────────────
     api_sources = [
-        ("Remotive",        lambda: search_jobs_remotive(keywords[:5])),
-        ("RemoteOK",        lambda: search_jobs_remoteok()),
-        ("WeWorkRemotely",  lambda: search_jobs_weworkremotely()),
-        ("LinkedIn",        lambda: search_jobs_linkedin(keywords[:4])),
-        ("Reed",            lambda: search_jobs_reed(keywords[:4])),
-        ("The Muse",        lambda: search_jobs_themuse(keywords[:3])),
-        ("Adzuna",          lambda: search_jobs_adzuna()),
-        ("USAJobs",         lambda: search_jobs_usajobs(keywords[:3])),
-        ("Google Jobs",     lambda: search_jobs_serpapi()),
+        ("Remotive",           lambda: search_jobs_remotive(keywords[:5])),
+        ("RemoteOK",           lambda: search_jobs_remoteok()),
+        ("WeWorkRemotely",     lambda: search_jobs_weworkremotely()),
+        ("LinkedIn",           lambda: search_jobs_linkedin(keywords[:4])),
+        ("Reed",               lambda: search_jobs_reed(keywords[:4])),
+        ("The Muse",           lambda: search_jobs_themuse(keywords[:3])),
+        ("Adzuna",             lambda: search_jobs_adzuna()),
+        ("USAJobs",            lambda: search_jobs_usajobs(keywords[:3])),
+        ("Google Jobs",        lambda: search_jobs_serpapi()),
+        ("Greenhouse Boards",  lambda: search_jobs_greenhouse()),
+        ("Lever Boards",       lambda: search_jobs_lever()),
+        ("Built In DC",        lambda: search_jobs_builtin()),
     ]
 
+    # ── JobSpy (Indeed + Glassdoor + ZipRecruiter, anti-detect) ─────────────
     # ── Playwright JS-rendered sources ───────────────────────────────────────
     pw_sources = [
-        ("Dice (DC/VA/MD)", lambda: search_jobs_dice()),
-        ("Glassdoor",       lambda: search_jobs_glassdoor()),
-        ("ZipRecruiter",    lambda: search_jobs_ziprecruiter()),
-        ("Monster",         lambda: search_jobs_monster()),
-        ("CareerBuilder",   lambda: search_jobs_careerbuilder()),
-        ("Workday Portals", lambda: search_jobs_workday()),
+        ("Indeed/GD/ZipR",    lambda: search_jobs_jobspy()),
+        ("Dice (DC/VA/MD)",   lambda: search_jobs_dice()),
+        ("Workday Portals",   lambda: search_jobs_workday()),
     ]
 
     for name, fn in api_sources + pw_sources:
-        print(f"  [{name:<16}] ", end="", flush=True)
+        print(f"  [{name:<18}] ", end="", flush=True)
         try:
             results = fn()
             print(f"{len(results)} results")
